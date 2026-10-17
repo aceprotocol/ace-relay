@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.idea/
+.env
+.env.*
+vendor/
+dump.rdb

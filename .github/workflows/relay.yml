@@ -1,0 +1,346 @@
+# ACE Relay — CI/CD
+#
+# Every action is pinned to a full commit SHA with its release tag in a comment; let
+# Dependabot (package-ecosystem: github-actions) or Renovate keep the pins current —
+# bump SHA and comment together.
+#
+# Pushes to `test` deploy to the GitHub environment `test`, pushes to `main` to `prod`.
+# Every deployment-specific value comes from that environment (give `prod` required
+# reviewers and restrict both to their branch; `flush_once` runs through the same gate):
+#   variables: AWS_REGION, ECR_REPOSITORY, PUBLIC_RELAY_URL, APP_PORT, METRICS_PORT,
+#              REDIS_DB, DOCKER_NETWORK, VALKEY_CONTAINER, TRUSTED_REGISTRATION_NETWORKS,
+#              STORAGE_HIGH_WATER_BYTES, and optionally MCP_CONTAINER_IP
+#   secrets:   AWS_ROLE_ARN, ECR_REGISTRY, DEPLOY_INSTANCE_ID, VALKEY_PASSWORD_SSM_PARAM
+#
+# Until @ace-protocol/sdk is published, the jobs check out the sibling repos next to
+# this one (relay/, sdk-ts/, ace-spec/ in the workspace) so `file:../sdk-ts` resolves,
+# and the image build vendors the SDK as a tarball (scripts/vendor-local-deps.sh).
+
+name: ACE Relay
+
+on:
+  push:
+    branches: [test, main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - 'eslint.config.mjs'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      flush_once:
+        # One-time FLUSHDB of the deployed environment's relay db before the new container starts (README § Deploy).
+        # Only for a release that changes the stored format; never leave it on.
+        description: 'FLUSHDB the relay db of this branch environment before starting the new container'
+        type: boolean
+        default: false
+
+# Least privilege: only the deploy job (ECR push, SSM deploy) gets an OIDC token.
+permissions:
+  contents: read
+
+env:
+  # Sibling repos, pinned to full commit SHAs so verify and deploy test and ship the
+  # same code, and every image is reproducible from its relay commit. Bumping a pin
+  # is a reviewed relay commit; the two must be a coherent set (the relay tests replay
+  # ace-spec's test-vectors.json).
+  SDK_TS_REPO: aceprotocol/ace-sdk-ts
+  SDK_TS_SHA: f84e45e6082f50a2077f2f9d8ea5b13df0c46a99
+  ACE_SPEC_REPO: aceprotocol/ace-spec
+  ACE_SPEC_SHA: 12683ee23b5f42d5458dcd6697b0c7855a3bb146
+
+jobs:
+  # Gate the image build on the test suite. The suites talk to a real Redis at
+  # redis://localhost:16379/<db>, one db (1..15) per suite (table in tests/helpers.ts),
+  # and the capacity suite owns a second instance at 16380. A service container cannot
+  # take a command, hence `docker run`. No password: the throwaway CI instances have none.
+  # The pinned ace-spec sibling provides test-vectors.json (tests/vectors.test.ts).
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: relay
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ env.SDK_TS_REPO }}
+          ref: ${{ env.SDK_TS_SHA }}
+          path: sdk-ts
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ env.ACE_SPEC_REPO }}
+          ref: ${{ env.ACE_SPEC_SHA }}
+          path: ace-spec
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            relay/package-lock.json
+            sdk-ts/package-lock.json
+
+      - name: Check sibling pins
+        run: |
+          test "$(git -C sdk-ts rev-parse HEAD)" = "$SDK_TS_SHA" || { echo "sdk-ts is not at $SDK_TS_SHA"; exit 1; }
+          test "$(git -C ace-spec rev-parse HEAD)" = "$ACE_SPEC_SHA" || { echo "ace-spec is not at $ACE_SPEC_SHA"; exit 1; }
+
+      # Two instances: the suites' dbs, and one the capacity suite owns (it changes maxmemory).
+      - name: Start Valkey
+        run: |
+          docker run -d --name ci-valkey -p 16379:6379 valkey/valkey:8 valkey-server --save ''
+          docker run -d --name ci-valkey-capacity -p 16380:6379 valkey/valkey:8 valkey-server --save ''
+          for c in ci-valkey ci-valkey-capacity; do
+            for i in $(seq 1 20); do docker exec "$c" valkey-cli ping 2>/dev/null | grep -q PONG && continue 2; sleep 1; done
+            echo "$c did not start"; exit 1
+          done
+
+      - name: Build sdk-ts
+        working-directory: sdk-ts
+        run: npm ci && npm run build
+      - name: Verify SDK
+        working-directory: sdk-ts
+        run: npm run lint && npm test
+
+      - working-directory: relay
+        run: npm ci
+      - working-directory: relay
+        run: npm audit --omit=dev --audit-level=high
+      - working-directory: relay
+        run: npm run lint
+      # build is the full type check (same tsconfig as typecheck); it runs before the slower tests.
+      - working-directory: relay
+        run: npm run build
+      - working-directory: relay
+        run: npm test
+
+  # Build, push and deploy in one job of the branch's environment, so the environment's
+  # secrets and protection rules cover the image push as well as the deploy.
+  deploy:
+    needs: verify
+    if: github.ref_name == 'test' || github.ref_name == 'main'
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'test' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Fail before anything is built or pushed when the environment is incomplete.
+      - name: Check environment values
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          PUBLIC_RELAY_URL: ${{ vars.PUBLIC_RELAY_URL }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          METRICS_PORT: ${{ vars.METRICS_PORT }}
+          REDIS_DB: ${{ vars.REDIS_DB }}
+          DOCKER_NETWORK: ${{ vars.DOCKER_NETWORK }}
+          VALKEY_CONTAINER: ${{ vars.VALKEY_CONTAINER }}
+          # Operator-known registration egress (the Docker network subnet the hosted MCP reaches the relay
+          # from), comma-separated CIDRs. Required: without it every worker-triggered MCP registration shares
+          # one client network's budget and rate.
+          TRUSTED_REGISTRATION_NETWORKS: ${{ vars.TRUSTED_REGISTRATION_NETWORKS }}
+          # Total used memory of the Valkey at which growth stops (README § Resource bounds). Sane default:
+          # 402653184 (384 MiB) under a 512 MiB maxmemory. The measure is instance-wide, so every relay
+          # environment on one Valkey sees the same total.
+          STORAGE_HIGH_WATER_BYTES: ${{ vars.STORAGE_HIGH_WATER_BYTES }}
+          MCP_CONTAINER_IP: ${{ vars.MCP_CONTAINER_IP }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          DEPLOY_INSTANCE_ID: ${{ secrets.DEPLOY_INSTANCE_ID }}
+          VALKEY_PASSWORD_SSM_PARAM: ${{ secrets.VALKEY_PASSWORD_SSM_PARAM }}
+        run: |
+          for v in AWS_REGION ECR_REPOSITORY PUBLIC_RELAY_URL APP_PORT METRICS_PORT REDIS_DB DOCKER_NETWORK VALKEY_CONTAINER TRUSTED_REGISTRATION_NETWORKS STORAGE_HIGH_WATER_BYTES AWS_ROLE_ARN ECR_REGISTRY DEPLOY_INSTANCE_ID VALKEY_PASSWORD_SSM_PARAM; do
+            [ -n "${!v}" ] || { echo "environment value $v is not set" >&2; exit 1; }
+          done
+          [[ "$STORAGE_HIGH_WATER_BYTES" =~ ^[0-9]+$ ]] || { echo "STORAGE_HIGH_WATER_BYTES must be a byte count" >&2; exit 1; }
+          [ -z "$MCP_CONTAINER_IP" ] || [[ "$MCP_CONTAINER_IP" =~ ^[0-9]+([.][0-9]+){3}$ ]] || { echo "MCP_CONTAINER_IP must be an IPv4 address" >&2; exit 1; }
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: relay
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ env.SDK_TS_REPO }}
+          ref: ${{ env.SDK_TS_SHA }}
+          path: sdk-ts
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            relay/package-lock.json
+            sdk-ts/package-lock.json
+
+      # file:../sdk-ts cannot resolve inside the Docker build context: pack the SDK into
+      # relay/vendor/*.tgz, point the dependency at it, pin the SDK's transitive deps to
+      # sdk-ts's locked versions with exact `overrides`, refresh the lockfile and assert
+      # those entries match sdk-ts's lock (version + integrity); then audit the rewritten lock.
+      - name: Vendor local dependencies
+        run: |
+          test "$(git -C sdk-ts rev-parse HEAD)" = "$SDK_TS_SHA" || { echo "sdk-ts is not at $SDK_TS_SHA"; exit 1; }
+          (cd sdk-ts && npm ci && npm run build)
+          relay/scripts/vendor-local-deps.sh
+          (cd relay && npm audit --omit=dev --audit-level=high)
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Build & push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: relay
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.ref_name }}-${{ github.sha }}
+            ${{ secrets.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.ref_name }}-latest
+
+      - name: Deploy via SSM
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          IMAGE_URI: ${{ secrets.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.ref_name }}-${{ github.sha }}
+          INSTANCE_ID: ${{ secrets.DEPLOY_INSTANCE_ID }}
+          VALKEY_PASSWORD_PARAM: ${{ secrets.VALKEY_PASSWORD_SSM_PARAM }}
+          CONTAINER: relay-${{ github.ref_name == 'main' && 'prod' || 'test' }}
+          PUBLIC_RELAY_URL: ${{ vars.PUBLIC_RELAY_URL }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          METRICS_PORT: ${{ vars.METRICS_PORT }}
+          REDIS_DB: ${{ vars.REDIS_DB }}
+          DOCKER_NETWORK: ${{ vars.DOCKER_NETWORK }}
+          VALKEY_CONTAINER: ${{ vars.VALKEY_CONTAINER }}
+          TRUSTED_REGISTRATION_NETWORKS: ${{ vars.TRUSTED_REGISTRATION_NETWORKS }}
+          STORAGE_HIGH_WATER_BYTES: ${{ vars.STORAGE_HIGH_WATER_BYTES }}
+          # The static address (ace-mcp runs it with --ip) of this environment's hosted MCP container, if any:
+          # it calls the relay over the Docker network and forwards each end user's address in X-Forwarded-For,
+          # so it is a trusted proxy.
+          MCP_CONTAINER_IP: ${{ vars.MCP_CONTAINER_IP }}
+          FLUSH_ONCE: ${{ inputs.flush_once == true && 'true' || 'false' }}
+        run: |
+          # Build SSM commands as JSON array (each element = one script line)
+          #
+          # The host's reverse proxy is the only way in: app and metrics ports bind loopback,
+          # and the proxy reaches the container from the Docker network's gateway. TRUST_PROXY
+          # is loopback, exactly that gateway IP, and the MCP container's static IP (it
+          # forwards its users' addresses) — never a private range, which would let every
+          # container on the network spoof X-Forwarded-For and defeat every per-IP limit.
+          # Hop counts and `true` are rejected by src/config.ts.
+          #
+          # The Redis URL carries the Valkey password, so it never enters the container's
+          # environment (`docker inspect`) or a process argv: it is written with the `echo`
+          # builtin (umask 077) into a 0700 root directory, then 0400 owned by uid 1000 (the
+          # image's `node` user, see the Dockerfile's USER), and mounted read-only at
+          # /run/secrets/redis_url (REDIS_URL_FILE). src/config.ts refuses a
+          # group/world-accessible file.
+          #
+          # FLUSH_ONCE (workflow_dispatch input flush_once): after the old container stops and
+          # before it is removed, FLUSHDB this environment's relay db (REDIS_DB only). If the
+          # flush fails, the old container is started again and the deploy fails. The password
+          # reaches valkey-cli as REDISCLI_AUTH through the environment, never argv.
+          python3 -c "
+          import json
+          cmds = [
+              '#!/bin/bash',
+              'set -euo pipefail',
+              'AWS_REGION=\"$AWS_REGION\"',
+              'ECR_REGISTRY=\"$ECR_REGISTRY\"',
+              'IMAGE_URI=\"$IMAGE_URI\"',
+              'CONTAINER=\"$CONTAINER\"',
+              'PUBLIC_RELAY_URL=\"$PUBLIC_RELAY_URL\"',
+              'APP_PORT=\"$APP_PORT\"',
+              'METRICS_PORT=\"$METRICS_PORT\"',
+              'REDIS_DB=\"$REDIS_DB\"',
+              'DOCKER_NETWORK=\"$DOCKER_NETWORK\"',
+              'VALKEY_CONTAINER=\"$VALKEY_CONTAINER\"',
+              'TRUSTED_REGISTRATION_NETWORKS=\"$TRUSTED_REGISTRATION_NETWORKS\"',
+              'STORAGE_HIGH_WATER_BYTES=\"$STORAGE_HIGH_WATER_BYTES\"',
+              'MCP_CONTAINER_IP=\"$MCP_CONTAINER_IP\"',
+              'VALKEY_PASSWORD_PARAM=\"$VALKEY_PASSWORD_PARAM\"',
+              'FLUSH_ONCE=\"$FLUSH_ONCE\"',
+              'GW=\$(docker network inspect \"\$DOCKER_NETWORK\" -f \"{{range .IPAM.Config}}{{.Gateway}} {{end}}\" | xargs -n1 | grep -E \"^[0-9]+([.][0-9]+){3}\$\" | head -n 1 || true)',
+              'test -n \"\$GW\" || { echo \"ERROR: no IPv4 gateway for the Docker network\"; exit 1; }',
+              'TRUST_PROXY=\"loopback,\$GW\${MCP_CONTAINER_IP:+,\$MCP_CONTAINER_IP}\"',
+              'echo \"TRUST_PROXY=\$TRUST_PROXY\"',
+              'VALKEY_PASSWORD=\$(aws ssm get-parameter --name \"\$VALKEY_PASSWORD_PARAM\" --with-decryption --query Parameter.Value --output text --region \"\$AWS_REGION\")',
+              'test -n \"\$VALKEY_PASSWORD\" || { echo \"ERROR: empty Valkey password\"; exit 1; }',
+              'export VALKEY_PASSWORD',
+              'VALKEY_PASSWORD_ENC=\$(python3 -c \"import os, sys, urllib.parse; sys.stdout.write(urllib.parse.quote(os.environ[sys.argv[1]], safe=str()))\" VALKEY_PASSWORD)',
+              'test -n \"\$VALKEY_PASSWORD_ENC\" || { echo \"ERROR: could not encode the Valkey password\"; exit 1; }',
+              'SECRET_DIR=/etc/ace-relay',
+              'REDIS_URL_HOST_FILE=\"\$SECRET_DIR/\$CONTAINER.redis-url\"',
+              'install -d -m 0700 -o root -g root \"\$SECRET_DIR\"',
+              '(umask 077; printf %s \"redis://:\${VALKEY_PASSWORD_ENC}@\${VALKEY_CONTAINER}:6379/\${REDIS_DB}\" > \"\$REDIS_URL_HOST_FILE.tmp\")',
+              'unset VALKEY_PASSWORD_ENC',
+              'chown 1000:1000 \"\$REDIS_URL_HOST_FILE.tmp\"',
+              'chmod 0400 \"\$REDIS_URL_HOST_FILE.tmp\"',
+              'mv -f \"\$REDIS_URL_HOST_FILE.tmp\" \"\$REDIS_URL_HOST_FILE\"',
+              'aws ecr get-login-password --region \"\$AWS_REGION\" | docker login --username AWS --password-stdin \"\$ECR_REGISTRY\"',
+              'docker pull \"\$IMAGE_URI\"',
+              'docker stop -t 30 \"\$CONTAINER\" 2>/dev/null || true',
+              'if [ \"\$FLUSH_ONCE\" = true ]; then echo \"FLUSHDB of the relay db\"; if ! REDISCLI_AUTH=\"\$VALKEY_PASSWORD\" docker exec -e REDISCLI_AUTH \"\$VALKEY_CONTAINER\" valkey-cli -n \"\$REDIS_DB\" FLUSHDB | grep -qx OK; then echo \"ERROR: FLUSHDB failed; restarting the old container\"; docker start \"\$CONTAINER\" || true; exit 1; fi; fi',
+              'docker rm \"\$CONTAINER\" 2>/dev/null || true',
+              'docker image prune -f 2>/dev/null || true',
+              'unset VALKEY_PASSWORD',
+              'docker run -d --name \"\$CONTAINER\" --network \"\$DOCKER_NETWORK\" --restart unless-stopped -p \"127.0.0.1:\${APP_PORT}:3000\" -p \"127.0.0.1:\${METRICS_PORT}:9090\" -e NODE_ENV=production -e \"TRUST_PROXY=\$TRUST_PROXY\" -e PUBLIC_RELAY_URL=\"\$PUBLIC_RELAY_URL\" -e TRUSTED_REGISTRATION_NETWORKS=\"\$TRUSTED_REGISTRATION_NETWORKS\" -e STORAGE_HIGH_WATER_BYTES=\"\$STORAGE_HIGH_WATER_BYTES\" -v \"\${REDIS_URL_HOST_FILE}:/run/secrets/redis_url:ro\" -e REDIS_URL_FILE=/run/secrets/redis_url \"\$IMAGE_URI\"',
+              'sleep 10',
+              'if ! docker ps --filter \"name=\$CONTAINER\" --filter \"status=running\" -q | grep -q .; then echo \"ERROR: Container not running\"; docker logs --tail 50 \"\$CONTAINER\" 2>&1 || true; exit 1; fi',
+              'for i in \$(seq 1 10); do if curl -sf \"http://127.0.0.1:\${APP_PORT}/health\" > /dev/null 2>&1; then echo \"Health check passed (attempt \$i)\"; exit 0; fi; echo \"Attempt \$i failed...\"; sleep 5; done',
+              'echo \"ERROR: Health check failed\"; docker logs --tail 50 \"\$CONTAINER\" 2>&1 || true; exit 1'
+          ]
+          with open('/tmp/ssm-params.json', 'w') as f:
+              json.dump({'commands': cmds}, f)
+          "
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 300 \
+            --query 'Command.CommandId' --output text)
+
+          echo "SSM Command ID: $CMD_ID"
+
+          # Poll for completion
+          for i in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deploy succeeded"
+              aws ssm get-command-invocation \
+                --command-id "$CMD_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'StandardOutputContent' --output text
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "Deploy failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id "$CMD_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query '[StandardOutputContent,StandardErrorContent]' --output text
+              exit 1
+            fi
+          done
+          echo "ERROR: SSM command timed out"
+          exit 1

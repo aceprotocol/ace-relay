@@ -1,0 +1,40 @@
+services:
+  relay:
+    build: .
+    ports:
+      # Bind to loopback so the plaintext port is reachable only by the host's
+      # nginx (which terminates TLS), not directly from the internet.
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:9090:9090"
+    environment:
+      REDIS_URL: redis://valkey:6379
+      NODE_ENV: production
+      # The authentication audience and descriptor route; required in production.
+      PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:?set PUBLIC_RELAY_URL, e.g. https://relay.example.org}
+      # Host nginx reaches the relay via Docker's port proxy, i.e. from relay-network's gateway (pinned below); trust only that hop.
+      TRUST_PROXY: "loopback,172.30.0.1"
+    depends_on:
+      valkey:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - relay-network
+
+  valkey:
+    image: valkey/valkey:8
+    command: valkey-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    volumes:
+      - valkey-data:/data
+    restart: unless-stopped
+    networks:
+      - relay-network
+
+volumes:
+  valkey-data:
+
+networks:
+  relay-network:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
