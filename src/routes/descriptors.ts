@@ -4,7 +4,7 @@ import {
 } from '@ace-protocol/sdk';
 import type { DescriptorStore } from '../store/descriptors.js';
 import type { BlockStore } from '../store/blocks.js';
-import { BUSY_RETRY_SECONDS, RelayError, relayBusy, sdk } from '../errors.js';
+import { RelayError, sdk, storageRefusal } from '../errors.js';
 import { authenticate, clientOf, enforceRate, enforceRegistrationRate, permittedSubject, type RouteDeps } from './shared.js';
 
 interface DescriptorDeps extends RouteDeps {
@@ -56,8 +56,7 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     // A handle is claimed only where this relay is the primary route. The store checks the registration and its KEL.
     const handle = d.visibility === 'public' && d.handle !== undefined && d.relays[0] === audience ? d.handle : '';
     const status = await descriptors.publish(agent, state.lastHash, documentDigest(d), handle, now);
-    if (status === 'rate_limited') throw new RelayError(status, "the identity's registration network is over its storage budget", BUSY_RETRY_SECONDS);
-    if (status === 'relay_busy') throw relayBusy();
+    if (status === 'rate_limited' || status === 'relay_busy') throw storageRefusal(status);
     if (status !== 'published') throw new RelayError(status);
     return { ok: true };
   });
@@ -105,8 +104,7 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     const { identity } = await authenticate(deps, req, { action: 'block', peer, blocked, revision });
     if (peer === identity.aceId) throw new RelayError('invalid_argument', 'cannot block yourself');
     const status = await blocks.set(identity.aceId, peer, blocked, revision, identity.lastHash);
-    if (status === 'relay_busy') throw relayBusy();
-    if (status === 'rate_limited') throw new RelayError(status, "the identity's registration network is over its storage budget", BUSY_RETRY_SECONDS);
+    if (status === 'rate_limited' || status === 'relay_busy') throw storageRefusal(status);
     if (status !== 'ok') throw new RelayError(status);
     return { ok: true };
   });

@@ -71,7 +71,20 @@ export interface RelayConfig {
   sseCatchupLimit: number;
   /** A listen stream whose buffered output does not drain within this many ms is destroyed. */
   sseWriteTimeoutMs: number;
+
+  /**
+   * Wake hints (07 § Wake hints): the gateways a registration may name, as canonical https URLs compared exactly; `*`
+   * alone accepts any public https gateway. Empty (the default) offers no wake hints: both routes answer 404 not_found.
+   */
+  wakeGateways: string[];
+  /** Least interval between two wakes of one identity; a wake due sooner is deferred, never dropped. */
+  wakeMinIntervalSeconds: number;
+  /** Bound of one wake request (DNS, connect and response). */
+  wakeTimeoutMs: number;
 }
+
+/** WAKE_GATEWAYS value accepting any public https gateway. */
+export const ANY_WAKE_GATEWAY = '*';
 
 /** `address/prefix` CIDRs (IPv4 or IPv6), parsed once into matchers. A malformed entry throws. */
 export function parseCidrs(list: readonly string[]): TrustedNetwork[] {
@@ -84,6 +97,11 @@ export function parseCidrs(list: readonly string[]): TrustedNetwork[] {
     matcher.addSubnet(m[1], prefix, family === 4 ? 'ipv4' : 'ipv6');
     return { cidr, list: matcher };
   });
+}
+
+/** A comma-separated list from the environment, entries trimmed, empty ones dropped. */
+function envList(key: string): string[] {
+  return (process.env[key] ?? '').split(',').map((x) => x.trim()).filter((x) => x !== '');
 }
 
 /** A non-negative integer from the environment. A malformed value fails startup. */
@@ -174,10 +192,23 @@ export function validateConfig(c: RelayConfig, production = process.env.NODE_ENV
     ['SSE_CATCHUP_LIMIT', c.sseCatchupLimit],
     ['SSE_WRITE_TIMEOUT_MS', c.sseWriteTimeoutMs],
     ['HEARTBEAT_INTERVAL_MS', c.heartbeatIntervalMs],
+    ['WAKE_TIMEOUT_MS', c.wakeTimeoutMs],
   ] as const) {
     if (value < 1) throw new Error(`${name}=${value}: must be at least 1`);
   }
+  if (c.wakeGateways.includes(ANY_WAKE_GATEWAY) && c.wakeGateways.length !== 1) throw new Error(`WAKE_GATEWAYS: '${ANY_WAKE_GATEWAY}' must stand alone`);
+  for (const g of c.wakeGateways) {
+    if (g !== ANY_WAKE_GATEWAY && !isCanonicalRelayUrl(g, { allowLoopback: false })) throw new Error(`WAKE_GATEWAYS: ${g} must be a canonical https URL`);
+  }
   return c;
+}
+
+/**
+ * Whether a wake registration may name `gateway` (07 § Wake hints): a listed gateway (validated at startup), or with
+ * `*` any canonical https URL. The wake request itself only reaches public addresses.
+ */
+export function acceptsGateway(c: RelayConfig, gateway: string): boolean {
+  return c.wakeGateways[0] === ANY_WAKE_GATEWAY ? isCanonicalRelayUrl(gateway, { allowLoopback: false }) : c.wakeGateways.includes(gateway);
 }
 
 export function loadConfig(production = process.env.NODE_ENV === 'production'): RelayConfig {
@@ -202,7 +233,7 @@ export function loadConfig(production = process.env.NODE_ENV === 'production'): 
     maxInboxSenderBytes: envInt('MAX_INBOX_SENDER_BYTES', 8 * 1024 * 1024),
     storageHighWaterBytes: envInt('STORAGE_HIGH_WATER_BYTES', 384 * 1024 * 1024),
     registrationNetworkBytes: envInt('REGISTRATION_NETWORK_BYTES', 96 * 1024 * 1024),
-    trustedRegistrationNetworks: parseCidrs((process.env.TRUSTED_REGISTRATION_NETWORKS ?? '').split(',').map((x) => x.trim()).filter((x) => x !== '')),
+    trustedRegistrationNetworks: parseCidrs(envList('TRUSTED_REGISTRATION_NETWORKS')),
     trustedRegistrationNetworkBytes: envInt('TRUSTED_REGISTRATION_NETWORK_BYTES', 256 * 1024 * 1024),
 
     ssePerIdentity: envInt('SSE_PER_IDENTITY', 3),
@@ -211,5 +242,9 @@ export function loadConfig(production = process.env.NODE_ENV === 'production'): 
     drainMs: envInt('DRAIN_MS', 10_000),
     sseCatchupLimit: envInt('SSE_CATCHUP_LIMIT', 200),
     sseWriteTimeoutMs: envInt('SSE_WRITE_TIMEOUT_MS', 30_000),
+
+    wakeGateways: envList('WAKE_GATEWAYS'),
+    wakeMinIntervalSeconds: envInt('WAKE_MIN_INTERVAL_SECONDS', 30),
+    wakeTimeoutMs: envInt('WAKE_TIMEOUT_MS', 5_000),
   }, production);
 }

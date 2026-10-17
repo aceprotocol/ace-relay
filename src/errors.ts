@@ -37,6 +37,11 @@ export const BUSY_RETRY_SECONDS = 60;
 /** The relay-wide capacity refusal (07 § Send: `rate_limited` as a last resort before the store is exhausted). */
 export const relayBusy = (): RelayError => new RelayError('rate_limited', 'relay storage is at capacity', BUSY_RETRY_SECONDS);
 
+/** A write an identity's store refused for storage: its registration network's byte budget, or the relay's capacity. */
+export const storageRefusal = (status: 'rate_limited' | 'relay_busy'): RelayError => (status === 'relay_busy'
+  ? relayBusy()
+  : new RelayError('rate_limited', "the identity's registration network is over its storage budget", BUSY_RETRY_SECONDS));
+
 /** A rejection a handler or store raises; the error handler turns it into `{error, message?}`. */
 export class RelayError extends Error {
   constructor(

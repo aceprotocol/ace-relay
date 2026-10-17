@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { MAX_SEND_BODY_BYTES, checkPacketTime, decodePacket, sha256Hex } from '@ace-protocol/sdk';
 import type { MessageStore } from '../store/messages.js';
 import type { BlockStore } from '../store/blocks.js';
@@ -10,7 +10,9 @@ interface SendDeps extends RouteDeps {
   messageStore: MessageStore;
   blocks: BlockStore;
   descriptors: DescriptorStore;
-  sseRegistry: { notify(aceId: string): Promise<void> };
+  sseRegistry: { notify(aceId: string): Promise<number> };
+  /** Present when the relay offers wake hints. */
+  dispatcher?: { queued(aceId: string): void };
 }
 /**
  * The single answer to every send the relay refuses for admission: unknown, unregistered, non-public or blocking
@@ -35,7 +37,7 @@ export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<
   const { identityStore, messageStore, blocks, descriptors, rateLimiter, config, clock } = deps;
   const full = (message?: string) => new RelayError('recipient_inbox_full', message, BUSY_RETRY_SECONDS);
 
-  app.post('/v1/send', { bodyLimit: MAX_SEND_BODY_BYTES, schema: sendSchema }, async (req: FastifyRequest) => {
+  app.post('/v1/send', { bodyLimit: MAX_SEND_BODY_BYTES, schema: sendSchema }, async (req: FastifyRequest, reply: FastifyReply) => {
     const body = req.body as { packet: unknown; permit?: unknown };
     // 1. Decode and the acceptance window.
     const packet = sdk(() => decodePacket(body.packet));
@@ -66,9 +68,14 @@ export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<
     }
     const result = await messageStore.enqueue(packet.to, json, digest, kind, { sender: packet.from, network });
     switch (result.status) {
-      case 'enqueued':
-        await deps.sseRegistry.notify(packet.to);
+      case 'enqueued': {
+        const listening = await deps.sseRegistry.notify(packet.to);
+        // A wake only once the response is written (07 § Wake hints): neither the response nor its timing depends on
+        // the recipient's registration.
+        const { dispatcher } = deps;
+        if (dispatcher && listening === 0) reply.raw.once('finish', () => dispatcher.queued(packet.to));
         return { ok: true };
+      }
       case 'duplicate':
         return { ok: true };
       case 'unknown_peer': // unregistered since it was read

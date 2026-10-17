@@ -9,7 +9,8 @@
 # reviewers and restrict both to their branch; `flush_once` runs through the same gate):
 #   variables: AWS_REGION, ECR_REPOSITORY, PUBLIC_RELAY_URL, APP_PORT, METRICS_PORT,
 #              REDIS_DB, DOCKER_NETWORK, VALKEY_CONTAINER, TRUSTED_REGISTRATION_NETWORKS,
-#              STORAGE_HIGH_WATER_BYTES, and optionally MCP_CONTAINER_IP
+#              STORAGE_HIGH_WATER_BYTES, and optionally MCP_CONTAINER_IP and WAKE_GATEWAYS (README; unset:
+#              no wake hints)
 #   secrets:   AWS_ROLE_ARN, ECR_REGISTRY, DEPLOY_INSTANCE_ID, VALKEY_PASSWORD_SSM_PARAM
 #
 # Until @ace-protocol/sdk is published, the jobs check out the sibling repos next to
@@ -52,13 +53,13 @@ env:
   # is a reviewed relay commit; the two must be a coherent set (the relay tests replay
   # ace-spec's test-vectors.json).
   SDK_TS_REPO: aceprotocol/ace-sdk-ts
-  SDK_TS_SHA: f84e45e6082f50a2077f2f9d8ea5b13df0c46a99
+  SDK_TS_SHA: b6bf6c5ef42111a54f05ded3cbd4c2a185c4bccc
   ACE_SPEC_REPO: aceprotocol/ace-spec
-  ACE_SPEC_SHA: 12683ee23b5f42d5458dcd6697b0c7855a3bb146
+  ACE_SPEC_SHA: 03ccaf4ee7a6f0387eb19def8b0e48d59475db42
 
 jobs:
   # Gate the image build on the test suite. The suites talk to a real Redis at
-  # redis://localhost:16379/<db>, one db (1..15) per suite (table in tests/helpers.ts),
+  # redis://localhost:16379/<db>, one db (0..15) per suite (table in tests/helpers.ts),
   # and the capacity suite owns a second instance at 16380. A service container cannot
   # take a command, hence `docker run`. No password: the throwaway CI instances have none.
   # The pinned ace-spec sibling provides test-vectors.json (tests/vectors.test.ts).
@@ -229,12 +230,15 @@ jobs:
           VALKEY_CONTAINER: ${{ vars.VALKEY_CONTAINER }}
           TRUSTED_REGISTRATION_NETWORKS: ${{ vars.TRUSTED_REGISTRATION_NETWORKS }}
           STORAGE_HIGH_WATER_BYTES: ${{ vars.STORAGE_HIGH_WATER_BYTES }}
+          WAKE_GATEWAYS: ${{ vars.WAKE_GATEWAYS }}
           # The static address (ace-mcp runs it with --ip) of this environment's hosted MCP container, if any:
           # it calls the relay over the Docker network and forwards each end user's address in X-Forwarded-For,
           # so it is a trusted proxy.
           MCP_CONTAINER_IP: ${{ vars.MCP_CONTAINER_IP }}
           FLUSH_ONCE: ${{ inputs.flush_once == true && 'true' || 'false' }}
         run: |
+          # Interpolated into the remote script below: URL characters only (the relay validates the URLs at startup).
+          [[ "$WAKE_GATEWAYS" =~ ^[A-Za-z0-9.:/_*,-]*$ ]] || { echo "WAKE_GATEWAYS has unexpected characters" >&2; exit 1; }
           # Build SSM commands as JSON array (each element = one script line)
           #
           # The host's reverse proxy is the only way in: app and metrics ports bind loopback,
@@ -272,6 +276,7 @@ jobs:
               'VALKEY_CONTAINER=\"$VALKEY_CONTAINER\"',
               'TRUSTED_REGISTRATION_NETWORKS=\"$TRUSTED_REGISTRATION_NETWORKS\"',
               'STORAGE_HIGH_WATER_BYTES=\"$STORAGE_HIGH_WATER_BYTES\"',
+              'WAKE_GATEWAYS=\"$WAKE_GATEWAYS\"',
               'MCP_CONTAINER_IP=\"$MCP_CONTAINER_IP\"',
               'VALKEY_PASSWORD_PARAM=\"$VALKEY_PASSWORD_PARAM\"',
               'FLUSH_ONCE=\"$FLUSH_ONCE\"',
@@ -299,7 +304,7 @@ jobs:
               'docker rm \"\$CONTAINER\" 2>/dev/null || true',
               'docker image prune -f 2>/dev/null || true',
               'unset VALKEY_PASSWORD',
-              'docker run -d --name \"\$CONTAINER\" --network \"\$DOCKER_NETWORK\" --restart unless-stopped -p \"127.0.0.1:\${APP_PORT}:3000\" -p \"127.0.0.1:\${METRICS_PORT}:9090\" -e NODE_ENV=production -e \"TRUST_PROXY=\$TRUST_PROXY\" -e PUBLIC_RELAY_URL=\"\$PUBLIC_RELAY_URL\" -e TRUSTED_REGISTRATION_NETWORKS=\"\$TRUSTED_REGISTRATION_NETWORKS\" -e STORAGE_HIGH_WATER_BYTES=\"\$STORAGE_HIGH_WATER_BYTES\" -v \"\${REDIS_URL_HOST_FILE}:/run/secrets/redis_url:ro\" -e REDIS_URL_FILE=/run/secrets/redis_url \"\$IMAGE_URI\"',
+              'docker run -d --name \"\$CONTAINER\" --network \"\$DOCKER_NETWORK\" --restart unless-stopped -p \"127.0.0.1:\${APP_PORT}:3000\" -p \"127.0.0.1:\${METRICS_PORT}:9090\" -e NODE_ENV=production -e \"TRUST_PROXY=\$TRUST_PROXY\" -e PUBLIC_RELAY_URL=\"\$PUBLIC_RELAY_URL\" -e TRUSTED_REGISTRATION_NETWORKS=\"\$TRUSTED_REGISTRATION_NETWORKS\" -e STORAGE_HIGH_WATER_BYTES=\"\$STORAGE_HIGH_WATER_BYTES\" -e WAKE_GATEWAYS=\"\$WAKE_GATEWAYS\" -v \"\${REDIS_URL_HOST_FILE}:/run/secrets/redis_url:ro\" -e REDIS_URL_FILE=/run/secrets/redis_url \"\$IMAGE_URI\"',
               'sleep 10',
               'if ! docker ps --filter \"name=\$CONTAINER\" --filter \"status=running\" -q | grep -q .; then echo \"ERROR: Container not running\"; docker logs --tail 50 \"\$CONTAINER\" 2>&1 || true; exit 1; fi',
               'for i in \$(seq 1 10); do if curl -sf \"http://127.0.0.1:\${APP_PORT}/health\" > /dev/null 2>&1; then echo \"Health check passed (attempt \$i)\"; exit 0; fi; echo \"Attempt \$i failed...\"; sleep 5; done',

@@ -7,8 +7,8 @@ import { MAX_PACKET_BYTES } from '@ace-protocol/sdk';
 import { BLOCK_BYTES } from '../src/store/blocks.js';
 import { FULL_STORE_RESERVE_BYTES } from '../src/store/lua.js';
 import {
-  CAPACITY_REDIS_ORIGIN, REDIS_URL, ack, authHeaders, block, createTestRelay, inbox, newAgent, now, packet, permit, publish, published,
-  register, registered, send, type Agent, type TestRelay,
+  CAPACITY_REDIS_ORIGIN, REDIS_URL, ack, authHeaders, block, createTestRelay, deleteWake, inbox, newAgent, now, packet, permit, publish,
+  published, putWake, register, registered, send, wakeOf, type Agent, type TestRelay,
 } from './helpers.js';
 
 const origin = { origin: CAPACITY_REDIS_ORIGIN };
@@ -146,6 +146,25 @@ describe('relay-wide capacity', () => {
       expect(after).toBeLessThan(before + BLOCK_BYTES + 512);
       expect(await r.redis.hget(`ace:identity:${owner.aceId}`, 'bb')).toBeNull();
     } finally {
+      await r.close();
+    }
+  }, 60_000);
+
+  it('out of memory: a new wake registration is 429; re-arming reads and DELETE /v1/wake still run', async () => {
+    const gateway = 'https://push.example/ace', token = 'w'.repeat(32);
+    const r = await createTestRelay(0, { wakeGateways: [gateway] }, { ...origin, wakeFetch: (async () => new Response(null, { status: 204 })) as typeof fetch });
+    try {
+      const { to, bare } = await seed(r);
+      expect((await putWake(r, to, gateway, token)).statusCode).toBe(200);
+      await admin.config('SET', 'maxmemory-policy', 'noeviction');
+      await admin.config('SET', 'maxmemory', String((await usedMemory()) - 64 * 1024));
+      const refused = await putWake(r, bare, gateway, token);
+      expect([refused.statusCode, refused.json().error]).toEqual([429, 'rate_limited']);
+      expect((await inbox(r, to)).statusCode).toBe(200); // re-arms in place
+      expect((await deleteWake(r, to)).statusCode).toBe(200);
+      expect(await wakeOf(r, to.aceId)).toBeNull();
+    } finally {
+      await admin.config('SET', 'maxmemory', '0');
       await r.close();
     }
   }, 60_000);

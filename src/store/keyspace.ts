@@ -7,7 +7,8 @@
  * | prefix            | type   | lifetime                                                                  |
  * |-------------------|--------|---------------------------------------------------------------------------|
  * | identity:<id>     | hash   | KEL, signing seq/key, registration timestamp, kb (charged KEL bytes),      |
- * |                   |        | bb (charged block bytes), regnet; after unregister a retiredAt barrier,    |
+ * |                   |        | bb (charged block bytes), wb (charged wake bytes), regnet; after          |
+ * |                   |        | unregister a retiredAt barrier,                                           |
  * |                   |        | expiring OFFLINE_WINDOW                                                   |
  * | horizon:<id>      | hash   | forever, written at unregister (fixed size): retiredAt, epochSeq +        |
  * |                   |        | epochStartHash, lastSeq + lastHash, descriptor issuedAt + digest           |
@@ -16,6 +17,9 @@
  * | descriptors       | zset   | public directory (lex by ACE ID)                                          |
  * | handle:<handle>   | string | owner ACE ID, expires with the descriptor                                 |
  * | blocks:<id>       | hash   | peer → "<revision>:<0|1>", until unregister                               |
+ * | wake:<id>         | hash   | g (gateway), t (token), a (armed 1|0), w (last wake ms); expires          |
+ * |                   |        | OFFLINE_WINDOW after the identity's last wake/inbox/ack/listen; deleted   |
+ * |                   |        | at unregister                                                             |
  * | inbox:<id>        | stream | packets; fields json, n, k (n|s), d (digest), b (bucket), f (from) | c (net) |
  * | inbox-meta:<id>   | hash   | nn/nb (normal), fb:<from> (normal bytes per sender), sn (stranger),       |
  * |                   |        | sc:<net> (stranger entries per network), g:<bucket> (bytes per bucket),   |
@@ -35,6 +39,7 @@ export const DESCRIPTOR_KEY_PREFIX = 'ace:descriptor:';
 export const DIRECTORY_KEY = 'ace:descriptors';
 export const HANDLE_KEY_PREFIX = 'ace:handle:';
 export const BLOCKS_KEY_PREFIX = 'ace:blocks:';
+export const WAKE_KEY_PREFIX = 'ace:wake:';
 export const INBOX_KEY_PREFIX = 'ace:inbox:';
 export const INBOX_META_KEY_PREFIX = 'ace:inbox-meta:';
 export const INBOX_DEDUP_KEY_PREFIX = 'ace:inbox-dedup:';

@@ -140,8 +140,15 @@ export class SseRegistry {
     this.totalCount--;
   }
 
-  async notify(toAceId: string): Promise<void> {
-    await this.redis.publish(NOTIFY_KEY_PREFIX + toAceId, '');
+  /** Wakes the identity's streams on every replica; resolves with the number of replicas listening for it. */
+  async notify(toAceId: string): Promise<number> {
+    return this.redis.publish(NOTIFY_KEY_PREFIX + toAceId, '');
+  }
+
+  /** Whether any replica holds a listen stream of the identity (each subscribes its channel while it does). */
+  async listening(aceId: string): Promise<boolean> {
+    const [, n] = await this.redis.pubsub('NUMSUB', NOTIFY_KEY_PREFIX + aceId) as [string, number];
+    return Number(n) > 0;
   }
 
   /** Closes the identity's streams here and, through the notify channel, on every other replica. */

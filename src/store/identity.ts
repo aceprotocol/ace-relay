@@ -2,7 +2,8 @@ import type Redis from 'ioredis';
 import { OFFLINE_WINDOW_SECONDS, isACEId, sha256Hex, type KelEvent } from '@ace-protocol/sdk';
 import { RelayError } from '../errors.js';
 import {
-  BLOCKS_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, HANDLE_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, queueKeys,
+  BLOCKS_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, HANDLE_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
+  queueKeys,
 } from './keyspace.js';
 import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, RUNS_WHEN_FULL, budgetArgs, type ByteBudget } from './lua.js';
 
@@ -103,17 +104,20 @@ elseif ARGV[7] ~= '' or ARGV[8] ~= '' then
 end
 local rn, kb = ARGV[9], #ARGV[1]
 local jb = tonumber(redis.call('HGET', KEYS[2], 'jb') or '0')
--- Block records (bb) belong to an active identity only (unregister deletes them).
-local bb = 0
-if active then bb = tonumber(redis.call('HGET', KEYS[1], 'bb') or '0') end
+-- Block records (bb) and the wake registration (wb) belong to an active identity only (unregister deletes them).
+local bb, wb = 0, 0
+if active then
+  bb = tonumber(redis.call('HGET', KEYS[1], 'bb') or '0')
+  wb = tonumber(redis.call('HGET', KEYS[1], 'wb') or '0')
+end
 local held, old = 0, redis.call('HGET', KEYS[1], 'regnet')
-if active then held = tonumber(redis.call('HGET', KEYS[1], 'kb') or '0') + jb + bb end
-local need = kb + jb + bb
+if active then held = tonumber(redis.call('HGET', KEYS[1], 'kb') or '0') + jb + bb + wb end
+local need = kb + jb + bb + wb
 if old == rn then need = need - held end
 if overBudget(rn, need, tonumber(ARGV[10]), tonumber(ARGV[11]), tonumber(ARGV[12]), tonumber(ARGV[13])) then return 'rate_limited' end
 if need > 0 and atCapacity(tonumber(ARGV[14])) then return 'relay_busy' end
 if held > 0 then charge(old, -held) end
-charge(rn, kb + jb + bb)
+charge(rn, kb + jb + bb + wb)
 redis.call('HSET', KEYS[1], 'kel', ARGV[1], 'seq', ARGV[2], 'lastHash', ARGV[3], 'signingPublicKey', ARGV[4],
   'registeredAt', ARGV[5], 'requestDigest', ARGV[6], 'regnet', rn, 'kb', kb)
 redis.call('HDEL', KEYS[1], 'retiredAt')
@@ -131,8 +135,9 @@ return status
 // timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
 // It frees far more than the horizon it writes, so it runs even when the store is full. The handle key is derived from the stored descriptor (see keyspace). Deletes queue, descriptor
 // document, handle, directory entry and blocks; keeps the KEL, the descriptor's issuedAt/digest and a retiredAt
-// barrier for OFFLINE_WINDOW_SECONDS, and the fixed-size horizon (Horizon) forever (07 § Registration). The descriptor's
-// charge is released; the KEL's lapses with the packet window.
+// barrier for OFFLINE_WINDOW_SECONDS, and the fixed-size horizon (Horizon) forever (07 § Registration). The wake
+// registration (derived key) goes too. The descriptor's, blocks' and wake charges are released; the KEL's lapses with
+// the packet window.
 const UNREGISTER_IDENTITY_SCRIPT = RUNS_WHEN_FULL + IDENTITY_LUA + BYTES_LUA + `
 if not isActive(KEYS[1]) then return 'not_registered' end
 if redis.call('HGET', KEYS[1], 'lastHash') ~= ARGV[3] or redis.call('HGET', KEYS[1], 'requestDigest') ~= ARGV[4] then return 'identity_conflict' end
@@ -140,8 +145,10 @@ if tonumber(ARGV[1]) <= tonumber(redis.call('HGET', KEYS[1], 'registeredAt')) th
 local handle = redis.call('HGET', KEYS[2], 'handle') or ''
 if handle ~= '' and redis.call('GET', '${HANDLE_KEY_PREFIX}' .. handle) == ARGV[2] then redis.call('DEL', '${HANDLE_KEY_PREFIX}' .. handle) end
 local rn = redis.call('HGET', KEYS[1], 'regnet')
-charge(rn, -tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') - tonumber(redis.call('HGET', KEYS[1], 'bb') or '0'))
-redis.call('HDEL', KEYS[1], 'bb')
+charge(rn, -tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') - tonumber(redis.call('HGET', KEYS[1], 'bb') or '0')
+  - tonumber(redis.call('HGET', KEYS[1], 'wb') or '0'))
+redis.call('HDEL', KEYS[1], 'bb', 'wb')
+redis.call('DEL', '${WAKE_KEY_PREFIX}' .. ARGV[2])
 retire(rn, tonumber(redis.call('HGET', KEYS[1], 'kb') or '0'), tonumber(ARGV[5]), tonumber(ARGV[6]))
 redis.call('HDEL', KEYS[2], 'json', 'handle', 'lastHash', 'jb')
 redis.call('ZREM', KEYS[3], ARGV[2])
@@ -240,7 +247,7 @@ export class IdentityStore {
   }
 
   /**
-   * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor document, handle and blocks in one
+   * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor document, handle, blocks and wake in one
    * script; the KEL and a retiredAt barrier remain for OFFLINE_WINDOW_SECONDS, the horizon (`epoch`: the KEL's last
    * root epoch event and its last seq; its last hash is `expectedLastHash`) forever.
    */

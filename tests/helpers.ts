@@ -6,6 +6,7 @@
 //    1 register             2 descriptors        3 send               4 inbox            5 listen
 //    6 fp-minimal           7 vectors            8 e2e relay A        9 e2e relay B     10 operations
 //   11 fp-minimal (limits) 12 retention         13 register (rate)   14 directory      15 send (limits)
+//    0 wake
 //
 // The capacity suite owns a whole second instance, ACE_TEST_CAPACITY_REDIS_ORIGIN (default redis://localhost:16380):
 // it changes maxmemory and fills the store.
@@ -37,6 +38,7 @@ export function testConfig(overrides: TestOverrides = {}): RelayConfig {
     maxInboxSenderBytes: 64 * 1024 * 1024, storageHighWaterBytes: 1024 * 1024 * 1024,
     registrationNetworkBytes: 1024 * 1024 * 1024, trustedRegistrationNetworkBytes: 1024 * 1024 * 1024,
     ssePerIdentity: 3, globalSseLimit: 10_000, heartbeatIntervalMs: 60_000, drainMs: 0, sseCatchupLimit: 200, sseWriteTimeoutMs: 30_000,
+    wakeGateways: [], wakeMinIntervalSeconds: 30, wakeTimeoutMs: 5_000,
     ...overrides,
     trustedRegistrationNetworks: parseCidrs(overrides.trustedRegistrationNetworks ?? []),
   }, false);
@@ -51,11 +53,11 @@ export interface TestRelay extends RelayApp {
 
 /**
  * Builds the full relay on db `db` of `origin` (default REDIS_ORIGIN; flushed unless `flush: false`). `clock`: the
- * relay's protocol clock in Unix seconds (default the system clock).
+ * relay's protocol clock in Unix seconds (default the system clock). `wakeFetch`: the wake requests' fetch.
  */
 export async function createTestRelay(db: number, overrides: TestOverrides = {},
-  o: { clock?: () => number; flush?: boolean; origin?: string } = {}): Promise<TestRelay> {
-  return startRelay(REDIS_URL(db, o.origin), testConfig(overrides), o.flush ?? true, o.clock);
+  o: { clock?: () => number; flush?: boolean; origin?: string; wakeFetch?: typeof fetch } = {}): Promise<TestRelay> {
+  return startRelay(REDIS_URL(db, o.origin), testConfig(overrides), o.flush ?? true, o.clock, o.wakeFetch);
 }
 
 /** Another relay instance on db `db` (not flushed) with `relay`'s config: replicas sharing one Redis. */
@@ -63,11 +65,11 @@ export function createReplica(relay: TestRelay, db: number): Promise<TestRelay> 
   return startRelay(REDIS_URL(db), relay.config, false);
 }
 
-async function startRelay(url: string, config: RelayConfig, flush: boolean, clock?: () => number): Promise<TestRelay> {
+async function startRelay(url: string, config: RelayConfig, flush: boolean, clock?: () => number, wakeFetch?: typeof fetch): Promise<TestRelay> {
   const redis = new Redis(url);
   const subscriberRedis = new Redis(url);
   if (flush) await redis.flushdb();
-  const relay = await buildApp({ config, redis, subscriberRedis, clock });
+  const relay = await buildApp({ config, redis, subscriberRedis, clock, wakeFetch });
   await relay.app.ready();
   return {
     ...relay, redis, subscriberRedis, config,
@@ -166,6 +168,22 @@ export async function block(relay: TestRelay, owner: Agent, peer: string, blocke
     method: 'POST', url: '/v1/blocks', payload: { peer, blocked, revision },
     headers: await authHeaders(owner, { action: 'block', peer, blocked, revision }),
   });
+}
+
+export async function putWake(relay: TestRelay, agent: Agent, gateway: string, token: string) {
+  return relay.app.inject({
+    method: 'PUT', url: '/v1/wake', payload: { gateway, token }, headers: await authHeaders(agent, { action: 'wake', gateway, token }),
+  });
+}
+
+export async function deleteWake(relay: TestRelay, agent: Agent) {
+  return relay.app.inject({ method: 'DELETE', url: '/v1/wake', headers: await authHeaders(agent, { action: 'wake' }) });
+}
+
+/** The stored wake registration of `aceId`, or null. */
+export async function wakeOf(relay: TestRelay, aceId: string): Promise<{ gateway: string; token: string; armed: boolean } | null> {
+  const h = await relay.redis.hgetall(`ace:wake:${aceId}`);
+  return h.g === undefined ? null : { gateway: h.g, token: h.t, armed: h.a === '1' };
 }
 
 /** Ends each listen response once its catchup is written, so `inject` resolves with a finite body. */

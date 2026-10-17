@@ -13,11 +13,6 @@ export type BlockStatus = 'ok' | 'not_registered' | 'identity_conflict' | 'stale
 
 /** Values are "<revision>:<0|1>"; the revision is kept after an unblock (07 § Blocks). */
 const BLOCK_LUA = IDENTITY_LUA + `
-local function checkOwner()
-  if not isActive(KEYS[2]) then return 'not_registered' end
-  if redis.call('HGET', KEYS[2], 'lastHash') ~= ARGV[4] then return 'identity_conflict' end
-  return nil
-end
 -- Rewrites an existing record in place; nil when there is none.
 local function update(old)
   if tonumber(string.match(old, '^(%d+):')) >= tonumber(ARGV[2]) then return 'stale_revision' end
@@ -31,7 +26,7 @@ end
  * place (no growth), so it runs even when the store is full; `absent` when the peer has no record yet.
  */
 const UPDATE_BLOCK_SCRIPT = RUNS_WHEN_FULL + BLOCK_LUA + `
-local refused = checkOwner()
+local refused = checkOwner(KEYS[2], ARGV[4])
 if refused then return refused end
 local old = redis.call('HGET', KEYS[1], ARGV[1])
 if not old then return 'absent' end
@@ -44,7 +39,7 @@ return update(old)
  * over its budget; tracked as the identity's `bb` and released at unregister) and refused at the high-water mark.
  */
 const INSERT_BLOCK_SCRIPT = MAY_GROW + BLOCK_LUA + BYTES_LUA + CAPACITY_LUA + `
-local refused = checkOwner()
+local refused = checkOwner(KEYS[2], ARGV[4])
 if refused then return refused end
 local old = redis.call('HGET', KEYS[1], ARGV[1])
 if old then return update(old) end

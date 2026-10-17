@@ -133,7 +133,8 @@ export async function checkIpRate(deps: Pick<RouteDeps, 'rateLimiter' | 'config'
 
 /** Requests that free memory (or are needed to): their nonce may use the full-store reserve (ReplayStore). */
 const drains = (r: RelayAuthRequest): boolean =>
-  r.action === 'inbox' || r.action === 'inbox-ack' || r.action === 'unregister' || (r.action === 'block' && !r.blocked);
+  r.action === 'inbox' || r.action === 'inbox-ack' || r.action === 'unregister' || (r.action === 'block' && !r.blocked)
+  || (r.action === 'wake' && r.gateway === undefined);
 
 /**
  * 07 § Authentication: headers (`invalid_argument`) → registered (`not_registered`) → seq (`stale_seq` / `future_seq`)

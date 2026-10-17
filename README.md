@@ -28,6 +28,8 @@ request and derive the keys named by stored state (`src/store/keyspace.ts`).
 | `GET /v1/descriptors?profile&cursor&limit` | — | — | `{agents, cursor}` |
 | `POST /v1/blocks` | `block` | `{peer, blocked, revision}` | `{ok}` |
 | `POST /v1/send` | permit or public recipient | `{packet, permit?}` | `{ok}` |
+| `PUT /v1/wake` | `wake` | `{gateway, token}` | `{ok}` (only with `WAKE_GATEWAYS`) |
+| `DELETE /v1/wake` | `wake` | — | `{ok}` (only with `WAKE_GATEWAYS`) |
 | `GET /v1/inbox?since&limit` | `inbox` | — | `{messages: [{streamId, packet}], cursor}` |
 | `POST /v1/inbox/ack?through` | `inbox-ack` | — | `{ok}` |
 | `GET /v1/listen?since` | `listen` | — | `text/event-stream` |
@@ -83,12 +85,24 @@ identities from one address. Unregister closes the identity's streams on every i
 the notify channel); a stream also closes before writing a packet once the registration it was opened under is no
 longer current, which covers a lost notice and re-registration.
 
+**Wake hints** (optional, 07 § Wake hints). Off unless `WAKE_GATEWAYS` lists gateways (both routes are then
+`404 not_found`). `PUT /v1/wake {gateway, token}` stores one registration per identity, armed, charged 3 KiB to the
+identity's registration network once; `DELETE` removes it and its charge. After a send's response is written, an entry
+queued for an identity whose registration is armed and that has no open listen stream on any instance (Valkey `PUBSUB
+NUMSUB` of its notify channel) disarms it and sends one `POST <gateway>` with body `{"token": <token>}` (public DNS
+answers only, pinned connection, no redirects, `WAKE_TIMEOUT_MS`, one retry after a transport failure, 5xx or 429).
+Authenticated inbox, ack and listen requests re-arm it and restart its `OFFLINE_WINDOW_SECONDS` expiry; a wake due
+within `WAKE_MIN_INTERVAL_SECONDS` of the previous one is deferred, not dropped. A gateway answering 404 or 410 loses
+the registration. Unregister deletes it in the same script. The gateway contract: accept
+`POST` with `Content-Type: application/json` and `{"token"}`, answer 2xx, or 404/410 for a token it no longer knows;
+authenticate the relay, if at all, by arrangement (mTLS, source addresses).
+
 **Registration.** `{aceId, kel, timestamp, audience, signature}` verified by `verifyRegistrationRequest`. The KEL's
 bytes are charged to the registering network's byte budget (`429 rate_limited` when over it). New → `registered`;
 same timestamp and digest → `idempotent`; newer timestamp, same last event → `refreshed`; extended or recovered KEL →
 `rotated`; strict prefix → `stale_seq`; fork → `kel_conflict`; older timestamp, equal timestamp with another digest,
 or at or below the unregister barrier → `identity_conflict`. `unregister` needs an auth timestamp newer than the
-registration; it deletes queue, descriptor document, handle, directory entry and blocks atomically and closes listen
+registration; it deletes queue, descriptor document, handle, directory entry, blocks and wake registration atomically and closes listen
 streams. The KEL, the descriptor's newest `issuedAt`/digest and the barrier are kept for `OFFLINE_WINDOW_SECONDS`
 (their keys expire then), so a re-registration within that period must extend that history (or recover it, 01 rule
 6). A fixed-size **horizon** stays forever (`ace:horizon:<id>`): the barrier, the descriptor's `issuedAt`/digest, the
@@ -129,6 +143,8 @@ Superseded keys therefore cannot roll the identity back here.
 | `SSE_PER_IDENTITY` / `GLOBAL_SSE_LIMIT` | 3 / 10000 | listen stream bounds (`rate_limited`) |
 | `HEARTBEAT_INTERVAL_MS` / `SSE_CATCHUP_LIMIT` / `DRAIN_MS` | 25000 / 200 / 10000 | listen heartbeat, read page, shutdown drain |
 | `SSE_WRITE_TIMEOUT_MS` | 30000 | a listen stream whose output does not drain in time is destroyed |
+| `WAKE_GATEWAYS` | unset | comma-separated canonical gateway URLs a wake registration may name (exact match); `*` alone accepts any public https gateway; unset offers no wake hints. A loopback `http://` gateway is accepted outside production only |
+| `WAKE_MIN_INTERVAL_SECONDS` / `WAKE_TIMEOUT_MS` | 30 / 5000 | least interval between two wakes of one identity (later ones are deferred); bound of one wake request |
 
 Integer variables must be plain non-negative integers; a malformed value fails startup. Protocol limits are fixed:
 request bodies 64 KiB, except register and descriptor (`MAX_PUBLISHED_AGENT_BYTES`) and send

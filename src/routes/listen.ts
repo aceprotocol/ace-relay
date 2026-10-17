@@ -1,11 +1,14 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import type { SseRegistry } from '../sse/registry.js';
+import type { WakeStore } from '../store/wake.js';
 import { RelayError } from '../errors.js';
 import { authenticate, type RouteDeps } from './shared.js';
 import { SINCE_PATTERN } from './inbox.js';
 
 interface ListenDeps extends RouteDeps {
   sseRegistry: SseRegistry;
+  /** Present when the relay offers wake hints: listening re-arms them (07 § Wake hints). */
+  wakes?: WakeStore;
 }
 
 const listenSchema = {
@@ -23,6 +26,7 @@ export async function listenRoutes(app: FastifyInstance, deps: ListenDeps): Prom
     const since = (req.query as { since?: string }).since ?? '-';
     const { identity } = await authenticate(deps, req, { action: 'listen', since });
     const aceId = identity.aceId;
+    await deps.wakes?.rearm(aceId);
 
     const check = sseRegistry.canConnect(aceId);
     if (!check.ok) throw new RelayError('rate_limited', `SSE ${check.error}`, 60);

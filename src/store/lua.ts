@@ -38,10 +38,19 @@ local function withinReserve(reserve)
 end
 `;
 
-/** `isActive(key)`: the identity hash holds a live registration (a signing key and no retiredAt barrier). */
+/**
+ * `isActive(key)`: the identity hash holds a live registration (a signing key and no retiredAt barrier).
+ * `checkOwner(key, lastHash)`: nil for a live registration still at `lastHash` (the one the route authenticated),
+ * else `not_registered` / `identity_conflict`.
+ */
 export const IDENTITY_LUA = `
 local function isActive(key)
   return redis.call('HEXISTS', key, 'signingPublicKey') == 1 and redis.call('HEXISTS', key, 'retiredAt') == 0
+end
+local function checkOwner(key, lastHash)
+  if not isActive(key) then return 'not_registered' end
+  if redis.call('HGET', key, 'lastHash') ~= lastHash then return 'identity_conflict' end
+  return nil
 end
 `;
 
