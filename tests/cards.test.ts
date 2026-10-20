@@ -178,6 +178,26 @@ describe('handles', () => {
     }
   });
 
+  it('path relay ignores a binding from a root relay in the same db', async () => {
+    // The identity claimed `rooty` at the root relay; a path replica on the same db binds no handle, so that binding
+    // is no constraint there: a record naming it as home with no handle (or another one) is accepted and binds nothing.
+    const PATH_URL = `${RELAY_URL}/ace`;
+    const pathRelay = await createTestRelay(14, { publicRelayUrl: PATH_URL }, { flush: false });
+    try {
+      const a = await published(relay, { contact: 'closed', handle: 'rooty' });
+      expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
+      const bare = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false, now: now() + 1 });
+      expect((await postCard(pathRelay, bare)).json()).toEqual({ ok: true });
+      const other = await createCardRecord(a.id, { home: PATH_URL, handle: 'other', contact: 'closed', listed: false, now: now() + 2 });
+      expect((await postCard(pathRelay, other)).json()).toEqual({ ok: true });
+      expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(other);
+      expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
+      expect(await relay.redis.exists('ace:handle:other')).toBe(0);
+    } finally {
+      await pathRelay.close();
+    }
+  });
+
   it('card goes dark after rotation until re-signed', async () => {
     const a = await published(relay, { contact: 'open', listed: true, handle: 'rotor' });
     const from = await newAgent();

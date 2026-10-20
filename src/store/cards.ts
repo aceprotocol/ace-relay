@@ -18,10 +18,12 @@ const CLAIM_WINDOW_SECONDS = 86_400;
  * 07 § Descriptors and cards, in one script so the record, the handle binding and the directory entry change together.
  * KEYS: card hash, directory zset, identity hash, handle key (the record's handle, or the placeholder), handleof key,
  * claim counter. ARGV: aceId, issuedAt, claims digest, json, registered lastHash, at home ('1' | '0'), handle ('' when
- * none), contact, listed ('1' | '0'), claim limit, claim window, then the ByteBudget. Returns {status, retryAfter}.
+ * none), contact, listed ('1' | '0'), claim limit, claim window, the ByteBudget, then binds handles ('1' | '0'). Returns
+ * {status, retryAfter}.
  *
  * Handles are set once per home: once `handleof` holds a handle, every record naming this relay as home must carry it;
- * a record naming another home claims and changes nothing here. A new binding (handle and handleof, no TTL) is counted
+ * a record naming another home claims and changes nothing here. A relay that binds no handles (its public URL has a
+ * path) neither checks nor writes a binding: a record naming it as home is stored as signed. A new binding (handle and handleof, no TTL) is counted
  * against the client network's daily claims. The json's bytes are charged to the identity's registration network.
  * The record keeps the registered KEL's lastHash it was published under: after any KEL change (dlg, rot) it is treated
  * as absent (not served, `closed`, unlisted) until the identity republishes a re-signed record; handle bindings stay.
@@ -35,7 +37,7 @@ if at > issuedAt then return {'stale_descriptor', 0} end
 if at == issuedAt and redis.call('HGET', KEYS[1], 'digest') ~= ARGV[3] then return {'stale_descriptor', 0} end
 local atHome, handle = ARGV[6] == '1', ARGV[7]
 local bind = false
-if atHome then
+if atHome and ARGV[17] == '1' then
   local bound = redis.call('GET', KEYS[5])
   if bound then
     if bound ~= handle then return {'handle_mismatch', 0} end
@@ -95,13 +97,13 @@ export class CardStore {
 
   async publish(w: CardWrite): Promise<{ status: CardPublishStatus; retryAfter: number }> {
     const r = w.bundle.card;
-    // A relay that binds no handles passes none: the record is stored as signed and claims nothing.
+    // A relay that binds no handles neither checks nor writes a binding: the record is stored as signed, claiming nothing.
     const handle = w.bindsHandles ? r.handle ?? '' : '';
     const [status, retryAfter] = await this.redis.publishCard(
       CARD_KEY_PREFIX + r.aceId, DIRECTORY_KEY, IDENTITY_KEY_PREFIX + r.aceId, handleKey(handle), HANDLE_OF_KEY_PREFIX + r.aceId,
       `${RATE_KEY_PREFIX}handle-claim:${w.network}`,
       r.aceId, r.issuedAt, w.digest, JSON.stringify(w.bundle), w.lastHash, w.atHome ? '1' : '0', handle, r.contact, r.listed ? '1' : '0',
-      this.claimsPerDay, CLAIM_WINDOW_SECONDS, ...budgetArgs(this.budget),
+      this.claimsPerDay, CLAIM_WINDOW_SECONDS, ...budgetArgs(this.budget), w.bindsHandles ? '1' : '0',
     );
     return { status, retryAfter: Number(retryAfter) };
   }
