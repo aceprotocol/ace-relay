@@ -2,6 +2,9 @@ import { readFileSync, statSync } from 'node:fs';
 import { BlockList, isIP } from 'node:net';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, isCanonicalRelayUrl, normalizeRelayUrl } from '@ace-protocol/sdk';
 
+/** 02 constant (07 § Descriptors and cards): new handle bindings per client network per day. Import it from the SDK once it exports it. */
+export const HANDLE_CLAIMS_PER_NETWORK_PER_DAY = 8;
+
 /** Request body limit of the routes without their own (07 sets MAX_PUBLISHED_AGENT_BYTES and MAX_SEND_BODY_BYTES). */
 export const BODY_LIMIT_BYTES = 64 * 1024;
 
@@ -25,9 +28,9 @@ export interface RelayConfig {
 
   /** Requests per minute per fine client network (IPv4 address, IPv6 /64), on every route. */
   ipRateLimit: number;
-  /** Registrations, and separately descriptor publications, per hour per untrusted client network. */
+  /** Registrations, and separately descriptor and card publications, per hour per untrusted client network. */
   registerRateLimit: number;
-  /** Registrations (and separately descriptor publications) per hour from one trusted registration network. */
+  /** Registrations (and separately descriptor and card publications) per hour from one trusted registration network. */
   trustedRegisterRateLimit: number;
   /** Directory reads per minute per fine client network. */
   discoverRateLimit: number;
@@ -37,6 +40,8 @@ export interface RelayConfig {
   strangerIpRateLimit: number;
   /** Stranger sends per hour per recipient. */
   strangerRecipientRateLimit: number;
+  /** New handle bindings per day per client network (07 § Descriptors and cards, HANDLE_CLAIMS_PER_NETWORK_PER_DAY). */
+  handleClaimsPerNetworkPerDay: number;
 
   /** Normal queue retention, at most OFFLINE_WINDOW_SECONDS. */
   messageTtlSeconds: number;
@@ -226,6 +231,7 @@ export function loadConfig(production = process.env.NODE_ENV === 'production'): 
     sendRateLimit: envInt('SEND_RATE_LIMIT', 120),
     strangerIpRateLimit: envInt('STRANGER_IP_RATE_LIMIT', 30),
     strangerRecipientRateLimit: envInt('STRANGER_RECIPIENT_RATE_LIMIT', 60),
+    handleClaimsPerNetworkPerDay: envInt('HANDLE_CLAIMS_PER_NETWORK_PER_DAY', HANDLE_CLAIMS_PER_NETWORK_PER_DAY),
 
     messageTtlSeconds: envInt('MESSAGE_TTL_SECONDS', OFFLINE_WINDOW_SECONDS),
     maxInboxEntries: envInt('MAX_INBOX_ENTRIES', 10_000),

@@ -48,12 +48,16 @@ async function peer(home: string, o: Partial<NetworkClientOptions> = {}): Promis
 }
 
 describe('NetworkClient through the relay', () => {
-  it('one relay: discovery, explicit accept, message, receipt, block', async () => {
-    const alice = await peer(urlA, { visibility: 'public', handle: 'alice' });
+  it('one relay: discovery, handle, explicit accept, message, receipt, block', async () => {
+    const alice = await peer(urlA, { contact: 'open', listed: true, handle: 'alice' });
     const bob = await peer(urlA);
 
     expect((await bob.client.discover()).agents.map((a) => a.descriptor.aceId)).toEqual([alice.aceId]);
-    await expect(alice.client.agent(bob.aceId)).rejects.toMatchObject({ code: 'unknown_peer' }); // bob is private
+    expect((await bob.client.lookup('@alice@relay-a.test')).descriptor.aceId).toBe(alice.aceId);
+    expect((await bob.client.lookupCard('@alice@relay-a.test')).record).toMatchObject({ handle: 'alice', home: urlA, contact: 'open' });
+    // bob takes no contact requests from strangers: alice cannot reach him first.
+    expect((await alice.client.lookupCard(bob.aceId)).record).toMatchObject({ contact: 'closed', listed: false });
+    await expect(alice.client.connect(bob.aceId, { profile: 'ace:text:1' })).rejects.toMatchObject({ code: 'not_permitted' });
 
     await bob.client.connect(alice.aceId, { profile: 'ace:text:1', note: 'hi from bob' });
     const [request] = await alice.client.pull();
@@ -63,8 +67,8 @@ describe('NetworkClient through the relay', () => {
     expect((await bob.client.pull())[0]).toMatchObject({ kind: 'contact', event: { body: { kind: 'accepted' } } });
     expect((await bob.client.admission.get(alice.aceId))!.status).toBe('admitted');
 
-    // alice resolves bob's private descriptor with bob's permit.
-    expect((await alice.client.agent(bob.aceId, { refresh: true })).descriptor.visibility).toBe('private');
+    // Every registered identity's descriptor can be looked up by ACE ID.
+    expect((await alice.client.agent(bob.aceId, { refresh: true })).descriptor.aceId).toBe(bob.aceId);
 
     const entry = await bob.client.send(alice.aceId, 'ace:text:1', { message: 'hello alice' });
     expect(entry.status).toBe('pending');
@@ -81,7 +85,7 @@ describe('NetworkClient through the relay', () => {
   });
 
   it('two relays: each endpoint routes to the other\'s home relay', async () => {
-    const alice = await peer(urlA, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await peer(urlA, { contact: 'open', acceptProfiles: ['ace:text:1'] });
     const carol = await peer(urlB);
     const aliceAgent = await new RelayClient(urlA, { fetch: mappedFetch }).getDescriptor(alice.aceId);
 
@@ -106,7 +110,7 @@ describe('NetworkClient through the relay', () => {
   });
 
   it('follow() receives over the listen stream', async () => {
-    const alice = await peer(urlB, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await peer(urlB, { contact: 'open', acceptProfiles: ['ace:text:1'] });
     const dave = await peer(urlB);
     await dave.client.connect(alice.aceId, { profile: 'ace:text:1' });
     await alice.client.pull();

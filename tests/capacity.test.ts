@@ -31,7 +31,7 @@ const usedMemory = async () => Number(/used_memory:(\d+)/.exec(await admin.info(
  * identity without a descriptor.
  */
 async function seed(r: TestRelay): Promise<{ to: Agent; from: Agent; bare: Agent }> {
-  const to = await published(r, { visibility: 'public' }), from = await newAgent(), bare = await registered(r);
+  const to = await published(r, { contact: 'open' }), from = await newAgent(), bare = await registered(r);
   expect((await send(r, await packet(from, to), await permit(to, from))).statusCode).toBe(200);
   expect((await block(r, to, (await newAgent()).aceId, true, 1)).statusCode).toBe(200);
   expect((await block(r, to, from.aceId, true, 1)).statusCode).toBe(200);

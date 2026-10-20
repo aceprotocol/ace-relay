@@ -3,6 +3,7 @@ import { MAX_SEND_BODY_BYTES, checkPacketTime, decodePacket, sha256Hex } from '@
 import type { MessageStore } from '../store/messages.js';
 import type { BlockStore } from '../store/blocks.js';
 import type { DescriptorStore } from '../store/descriptors.js';
+import type { CardStore } from '../store/cards.js';
 import { BUSY_RETRY_SECONDS, RelayError, relayBusy, sdk } from '../errors.js';
 import { enforceRate, networkOf, permittedSubject, type RouteDeps } from './shared.js';
 
@@ -10,13 +11,14 @@ interface SendDeps extends RouteDeps {
   messageStore: MessageStore;
   blocks: BlockStore;
   descriptors: DescriptorStore;
+  cards: CardStore;
   sseRegistry: { notify(aceId: string): Promise<number> };
   /** Present when the relay offers wake hints. */
   dispatcher?: { queued(aceId: string): void };
 }
 /**
- * The single answer to every send the relay refuses for admission: unknown, unregistered, non-public or blocking
- * recipient, and missing or invalid permit look the same, so a caller cannot enumerate private agents or block lists.
+ * The single answer to every send the relay refuses for admission: unknown, unregistered, `closed` (or card-less) or
+ * blocking recipient, and missing or invalid permit look the same, so a caller cannot enumerate agents or block lists.
  */
 const notPermitted = (): RelayError => new RelayError('not_permitted', 'not permitted');
 
@@ -34,7 +36,7 @@ const sendSchema = {
  * everything keyed on it is bound either to a permit the recipient signed for `from`, or to the stranger allowance.
  */
 export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<void> {
-  const { identityStore, messageStore, blocks, descriptors, rateLimiter, config, clock } = deps;
+  const { identityStore, messageStore, blocks, descriptors, cards, rateLimiter, config, clock } = deps;
   const full = (message?: string) => new RelayError('recipient_inbox_full', message, BUSY_RETRY_SECONDS);
 
   app.post('/v1/send', { bodyLimit: MAX_SEND_BODY_BYTES, schema: sendSchema }, async (req: FastifyRequest, reply: FastifyReply) => {
@@ -59,9 +61,9 @@ export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<
       await enforceRate(rateLimiter, `send:${packet.to}:${packet.from}`, config.sendRateLimit, 60, 'identity');
       kind = 'normal';
     } else {
-      // 5. The stranger allowance of a public recipient.
-      const self = await descriptors.get(packet.to, now);
-      if (self?.descriptor.visibility !== 'public') throw notPermitted();
+      // 5. The stranger allowance of a recipient whose card record is `contact: open`, with an unexpired descriptor.
+      const [contact, self] = await Promise.all([cards.contactOf(packet.to), descriptors.get(packet.to, now)]);
+      if (contact !== 'open' || self === null) throw notPermitted();
       await enforceRate(rateLimiter, `stranger-ip:${network}`, config.strangerIpRateLimit, 3600, 'network');
       await enforceRate(rateLimiter, `stranger-to:${packet.to}`, config.strangerRecipientRateLimit, 3600, 'identity');
       kind = 'stranger';

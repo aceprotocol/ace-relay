@@ -1,7 +1,7 @@
 /**
  * Redis keyspace. Every key is built here from a validated ACE ID, handle or digest. Lua scripts receive the keys they
  * name from the request as KEYS and derive keys named by stored state: `regnet:<rn>` from the recipient's registration
- * network, `handle:<h>` from the stored descriptor's handle. This needs single-node Valkey (under Cluster these
+ * network. This needs single-node Valkey (under Cluster these
  * scripts already span slots and would need hash tags).
  *
  * | prefix            | type   | lifetime                                                                  |
@@ -11,11 +11,16 @@
  * |                   |        | unregister a retiredAt barrier,                                           |
  * |                   |        | expiring OFFLINE_WINDOW                                                   |
  * | horizon:<id>      | hash   | forever, written at unregister (fixed size): retiredAt, epochSeq +        |
- * |                   |        | epochStartHash, lastSeq + lastHash, descriptor issuedAt + digest           |
- * | descriptor:<id>   | hash   | newest issuedAt + claims digest (as long as the identity); json/handle/jb  |
- * |                   |        | (charged json bytes) until unregister                                      |
- * | descriptors       | zset   | public directory (lex by ACE ID)                                          |
- * | handle:<handle>   | string | owner ACE ID, expires with the descriptor                                 |
+ * |                   |        | epochStartHash, lastSeq + lastHash, descriptor issuedAt + digest, card    |
+ * |                   |        | cardIssuedAt + cardDigest                                                 |
+ * | descriptor:<id>   | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
+ * |                   |        | expiresAt/profiles/jb (charged json bytes) until unregister                |
+ * | card:<id>         | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
+ * |                   |        | contact/listed/jb (charged json bytes) until unregister; no TTL while     |
+ * |                   |        | registered; ignored while lastHash is not the registered KEL's            |
+ * | descriptors       | zset   | directory: identities whose card record is listed (lex by ACE ID)         |
+ * | handle:<handle>   | string | owner ACE ID; permanent, never reassigned (no TTL, survives unregister)   |
+ * | handleof:<id>     | string | the identity's handle at this relay; permanent like handle:<handle>       |
  * | blocks:<id>       | hash   | peer → "<revision>:<0|1>", until unregister                               |
  * | wake:<id>         | hash   | g (gateway), t (token), a (armed 1|0), w (last wake ms); expires          |
  * |                   |        | OFFLINE_WINDOW after the identity's last wake/inbox/ack/listen; deleted   |
@@ -37,7 +42,9 @@ export const IDENTITY_KEY_PREFIX = 'ace:identity:';
 export const HORIZON_KEY_PREFIX = 'ace:horizon:';
 export const DESCRIPTOR_KEY_PREFIX = 'ace:descriptor:';
 export const DIRECTORY_KEY = 'ace:descriptors';
+export const CARD_KEY_PREFIX = 'ace:card:';
 export const HANDLE_KEY_PREFIX = 'ace:handle:';
+export const HANDLE_OF_KEY_PREFIX = 'ace:handleof:';
 export const BLOCKS_KEY_PREFIX = 'ace:blocks:';
 export const WAKE_KEY_PREFIX = 'ace:wake:';
 export const INBOX_KEY_PREFIX = 'ace:inbox:';

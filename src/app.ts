@@ -5,6 +5,7 @@ import { applyHttpHardening } from './http/hardening.js';
 import { IdentityStore } from './store/identity.js';
 import { MessageStore } from './store/messages.js';
 import { DescriptorStore } from './store/descriptors.js';
+import { CardStore } from './store/cards.js';
 import { BlockStore } from './store/blocks.js';
 import { RateLimiter } from './store/rate-limit.js';
 import { ReplayStore } from './store/replay.js';
@@ -26,6 +27,7 @@ export interface RelayApp {
   identityStore: IdentityStore;
   messageStore: MessageStore;
   descriptorStore: DescriptorStore;
+  cardStore: CardStore;
   blockStore: BlockStore;
   sseRegistry: SseRegistry;
   storageMonitor: StorageMonitor;
@@ -69,6 +71,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<RelayApp> {
   const messageStore = new MessageStore(redis, config);
   const identityStore = new IdentityStore(redis, messageStore.budget);
   const descriptorStore = new DescriptorStore(redis, messageStore.budget);
+  const cardStore = new CardStore(redis, messageStore.budget, config.handleClaimsPerNetworkPerDay);
   const blockStore = new BlockStore(redis, messageStore.budget);
   const rateLimiter = new RateLimiter(redis, config.storageHighWaterBytes);
   const replayStore = new ReplayStore(redis);
@@ -87,12 +90,12 @@ export async function buildApp(opts: BuildAppOptions): Promise<RelayApp> {
   });
   await app.register(async (i) => healthRoutes(i, { storage: storageMonitor }));
   await app.register(async (i) => registerRoutes(i, { ...deps, sseRegistry }));
-  await app.register(async (i) => descriptorRoutes(i, { ...deps, descriptors: descriptorStore, blocks: blockStore }));
-  await app.register(async (i) => sendRoutes(i, { ...deps, messageStore, blocks: blockStore, descriptors: descriptorStore, sseRegistry, ...wake }));
+  await app.register(async (i) => descriptorRoutes(i, { ...deps, descriptors: descriptorStore, cards: cardStore, blocks: blockStore }));
+  await app.register(async (i) => sendRoutes(i, { ...deps, messageStore, blocks: blockStore, descriptors: descriptorStore, cards: cardStore, sseRegistry, ...wake }));
   await app.register(async (i) => inboxRoutes(i, { ...deps, messageStore, ...wake }));
   await app.register(async (i) => listenRoutes(i, { ...deps, sseRegistry, ...wake }));
   if (wakeDispatcher.enabled) await app.register(async (i) => wakeRoutes(i, { ...deps, wakes: wakeStore }));
 
   sseRegistry.startListening();
-  return { app, identityStore, messageStore, descriptorStore, blockStore, sseRegistry, storageMonitor, wakeStore, wakeDispatcher };
+  return { app, identityStore, messageStore, descriptorStore, cardStore, blockStore, sseRegistry, storageMonitor, wakeStore, wakeDispatcher };
 }

@@ -7,7 +7,7 @@ afterAll(async () => { await relay.close(); });
 
 describe('retention', () => {
   it('stranger entries expire after 86,400 s and free the allowance', async () => {
-    const to = await published(relay, { visibility: 'public' }), s = await newAgent();
+    const to = await published(relay, { contact: 'open' }), s = await newAgent();
     expect((await send(relay, await packet(s, to))).statusCode).toBe(200);
     const [id, score] = await relay.redis.zrange(`ace:inbox-strangers:${to.aceId}`, 0, -1, 'WITHSCORES');
     expect(Number(score) - Number(id.split('-')[0])).toBe(86_400_000);

@@ -13,7 +13,7 @@ afterAll(async () => { await relay.close(); });
 const queued = async (aceId: string) => relay.redis.xlen(`ace:inbox:${aceId}`);
 
 describe('POST /v1/send with a permit', () => {
-  it('queues for a private recipient with a permit it issued to the sender; never checks the sender', async () => {
+  it('queues for a closed recipient with a permit it issued to the sender; never checks the sender', async () => {
     const to = await published(relay), from = await newAgent(); // the sender is not registered anywhere
     const res = await send(relay, await packet(from, to), await permit(to, from));
     expect(res.statusCode).toBe(200);
@@ -77,16 +77,16 @@ describe('POST /v1/send with a permit', () => {
 });
 
 describe('POST /v1/send without a permit (stranger allowance)', () => {
-  it('requires a public recipient', async () => {
-    const priv = await published(relay), pub = await published(relay, { visibility: 'public' }), from = await newAgent();
-    expect((await send(relay, await packet(from, priv))).json().error).toBe('not_permitted');
-    expect((await send(relay, await packet(from, pub))).statusCode).toBe(200);
+  it('requires a recipient whose card record is contact: open', async () => {
+    const closed = await published(relay, { contact: 'closed' }), open = await published(relay, { contact: 'open' }), from = await newAgent();
+    expect((await send(relay, await packet(from, closed))).json().error).toBe('not_permitted');
+    expect((await send(relay, await packet(from, open))).statusCode).toBe(200);
     const unpublished = await registered(relay);
     expect((await send(relay, await packet(from, unpublished))).json().error).toBe('not_permitted');
   });
 
   it('holds at most 16 stranger entries per recipient, beside the normal queue', async () => {
-    const to = await published(relay, { visibility: 'public' });
+    const to = await published(relay, { contact: 'open' });
     const strangers = await Promise.all(Array.from({ length: 17 }, () => newAgent()));
     // At most STRANGER_NETWORK_ALLOWANCE (2) per client network: sixteen entries from eight /24s.
     const from = (i: number) => `198.18.${Math.floor(i / 2)}.${i}`;
@@ -103,7 +103,7 @@ describe('POST /v1/send without a permit (stranger allowance)', () => {
   it('rate-limits strangers per client network and per recipient', async () => {
     const limited = await createTestRelay(15, { strangerIpRateLimit: 1, strangerRecipientRateLimit: 2 });
     try {
-      const to = await published(limited, { visibility: 'public' });
+      const to = await published(limited, { contact: 'open' });
       const s = await newAgent();
       expect((await send(limited, await packet(s, to), undefined, '203.0.113.7')).statusCode).toBe(200);
       expect((await send(limited, await packet(s, to), undefined, '203.0.113.7')).json().error).toBe('rate_limited');
@@ -121,7 +121,7 @@ describe('POST /v1/send without a permit (stranger allowance)', () => {
 
 describe('POST /v1/send validation', () => {
   it('rejects malformed bodies and packets, unknown recipients (as not_permitted) and timestamps outside the window', async () => {
-    const to = await published(relay, { visibility: 'public' }), from = await newAgent();
+    const to = await published(relay, { contact: 'open' }), from = await newAgent();
     const p = await packet(from, to);
     expect((await send(relay, { ...p, ace: '2' })).json().error).toBe('unsupported_version');
     expect((await send(relay, { ...p, extra: 1 })).json().error).toBe('invalid_packet');
@@ -153,7 +153,7 @@ describe('POST /v1/send validation', () => {
   });
 
   it('an identical packet is accepted again without enqueuing, even when the allowance is full', async () => {
-    const to = await published(relay, { visibility: 'public' }), from = await newAgent();
+    const to = await published(relay, { contact: 'open' }), from = await newAgent();
     const p = await packet(from, to);
     expect((await send(relay, p)).statusCode).toBe(200);
     expect((await send(relay, JSON.parse(JSON.stringify(p)))).statusCode).toBe(200);
@@ -169,11 +169,11 @@ describe('POST /v1/send validation', () => {
   });
 });
 
-// Regression: review 2026-10-14 M4 — permit-less and blocked sends must not reveal registration, visibility or blocks.
+// Regression: review 2026-10-14 M4 — permit-less and blocked sends must not reveal registration, contact or blocks.
 describe('POST /v1/send admission is not an oracle', () => {
-  it('unknown, private, unpublished, blocking recipients and bad permits all answer the same 403', async () => {
+  it('unknown, closed, card-less, blocking recipients and bad permits all answer the same 403', async () => {
     const from = await newAgent();
-    const pub = await published(relay, { visibility: 'public' }), priv = await published(relay), bare = await registered(relay);
+    const pub = await published(relay, { contact: 'open' }), priv = await published(relay, { contact: 'closed' }), bare = await registered(relay);
     const unknown = await newAgent();
     expect((await block(relay, pub, from.aceId, true, 1)).statusCode).toBe(200);
     expect((await block(relay, priv, from.aceId, true, 1)).statusCode).toBe(200);
@@ -183,9 +183,9 @@ describe('POST /v1/send admission is not an oracle', () => {
     const answers = [
       await send(relay, await packet(from, unknown)), // unknown recipient, no permit
       await send(relay, await packet(from, unknown), await permit(unknown, from)), // unknown recipient, self-made permit
-      await send(relay, await packet(from, priv)), // private and blocking, no permit
+      await send(relay, await packet(from, priv)), // closed and blocking, no permit
       await send(relay, await packet(from, bare)), // registered, unpublished
-      await send(relay, await packet(from, pub)), // public, blocks the sender
+      await send(relay, await packet(from, pub)), // open, blocks the sender
       await send(relay, await packet(from, priv), await permit(bare, from)), // wrong issuer, blocking recipient
       await send(relay, await packet(from, blockedWithPermit), p), // valid permit, blocked
     ];
@@ -375,7 +375,7 @@ describe('stranger fairness per client network', () => {
   it('caps one network\'s entries in the allowance at STRANGER_NETWORK_ALLOWANCE; an ack frees them', async () => {
     const r = await createTestRelay(15);
     try {
-      const to = await published(r, { visibility: 'public' });
+      const to = await published(r, { contact: 'open' });
       for (let i = 0; i < 2; i++) expect((await send(r, await packet(await newAgent(), to), undefined, `203.0.113.${i}`)).statusCode).toBe(200);
       const full = await send(r, await packet(await newAgent(), to), undefined, '203.0.113.200');
       expect(full.json()).toEqual({ error: 'recipient_inbox_full', message: 'stranger allowance share of this client network is full' });
