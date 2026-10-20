@@ -1,14 +1,16 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
-  DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_PUBLISHED_AGENT_BYTES, documentDigest, isACEId, isHandle, verifyPublishedAgent,
+  DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_PUBLISHED_AGENT_BYTES, documentDigest, isACEId, isHandle, verifyCardBundle, verifyPublishedAgent,
 } from '@ace-protocol/sdk';
 import type { DescriptorStore } from '../store/descriptors.js';
+import type { CardStore } from '../store/cards.js';
 import type { BlockStore } from '../store/blocks.js';
 import { RelayError, sdk, storageRefusal } from '../errors.js';
-import { authenticate, clientOf, enforceRate, enforceRegistrationRate, permittedSubject, type RouteDeps } from './shared.js';
+import { authenticate, clientOf, enforceRate, enforceRegistrationRate, networkOf, type RouteDeps } from './shared.js';
 
 interface DescriptorDeps extends RouteDeps {
   descriptors: DescriptorStore;
+  cards: CardStore;
   blocks: BlockStore;
 }
 
@@ -24,15 +26,6 @@ const directorySchema = {
   },
 } as const;
 
-const resolveSchema = {
-  body: {
-    type: 'object',
-    additionalProperties: false,
-    required: ['aceId', 'permit'],
-    properties: { aceId: { type: 'string' }, permit: {} },
-  },
-} as const;
-
 const blockSchema = {
   body: {
     type: 'object',
@@ -42,20 +35,19 @@ const blockSchema = {
   },
 } as const;
 
-/** 07 § Descriptors and § Blocks. */
+/** 07 § Descriptors and cards, and § Blocks. */
 export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDeps): Promise<void> {
-  const { identityStore, descriptors, blocks, rateLimiter, config, clock } = deps;
+  const { descriptors, cards, blocks, rateLimiter, config, clock } = deps;
+  const audience = config.publicRelayUrl;
+  const verifyOpts = { allowLoopbackRelays: audience.startsWith('http://') };
 
   app.post('/v1/descriptor', { bodyLimit: MAX_PUBLISHED_AGENT_BYTES }, async (req: FastifyRequest) => {
     await enforceRegistrationRate(deps, req, 'descriptor');
-    const now = clock();
-    const audience = config.publicRelayUrl;
-    const { agent, state } = sdk(() => verifyPublishedAgent(req.body, now, { allowLoopbackRelays: audience.startsWith('http://') }));
+    const { agent, state } = sdk(() => verifyPublishedAgent(req.body, clock(), verifyOpts));
     const d = agent.descriptor;
     if (!d.relays.includes(audience)) throw new RelayError('invalid_argument', `descriptor relays must include ${audience}`);
-    // A handle is claimed only where this relay is the primary route. The store checks the registration and its KEL.
-    const handle = d.visibility === 'public' && d.handle !== undefined && d.relays[0] === audience ? d.handle : '';
-    const status = await descriptors.publish(agent, state.lastHash, documentDigest(d), handle, now);
+    // The store checks the registration and its KEL.
+    const status = await descriptors.publish(agent, state.lastHash, documentDigest(d));
     if (status === 'rate_limited' || status === 'relay_busy') throw storageRefusal(status);
     if (status !== 'published') throw new RelayError(status);
     return { ok: true };
@@ -65,30 +57,44 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     const { aceId } = req.params as { aceId: string };
     if (!isACEId(aceId)) throw new RelayError('unknown_peer');
     const agent = await descriptors.get(aceId, clock());
-    if (agent?.descriptor.visibility !== 'public') throw new RelayError('unknown_peer');
+    if (!agent) throw new RelayError('unknown_peer');
     return agent;
   });
 
-  // Any permit failure is unknown_peer: the endpoint never reveals whether a private identity exists.
-  app.post('/v1/descriptor/resolve', { schema: resolveSchema }, async (req: FastifyRequest) => {
-    const { aceId: target, permit } = req.body as { aceId: string; permit: unknown };
-    if (!isACEId(target)) throw new RelayError('invalid_argument', 'aceId must be an ACE ID');
-    const now = clock();
-    const identity = await identityStore.read(target);
-    const subject = identity && permittedSubject(identity, permit, undefined, now);
-    if (!subject) throw new RelayError('unknown_peer');
-    if (await blocks.isBlocked(target, subject)) throw new RelayError('unknown_peer');
-    const agent = await descriptors.get(target, now);
-    if (!agent) throw new RelayError('unknown_peer');
-    return agent;
+  // Self-authenticated by the record's signature; the store checks the registration, its KEL and the handle rules.
+  app.post('/v1/card', { bodyLimit: MAX_PUBLISHED_AGENT_BYTES }, async (req: FastifyRequest) => {
+    await enforceRegistrationRate(deps, req, 'card');
+    const { record, kelState, bundle } = sdk(() => verifyCardBundle(req.body, clock(), verifyOpts));
+    const { status, retryAfter } = await cards.publish({
+      bundle, lastHash: kelState.lastHash, digest: documentDigest(record), atHome: record.home === audience, network: networkOf(req),
+    });
+    switch (status) {
+      case 'published':
+        return { ok: true };
+      case 'handle_mismatch':
+        throw new RelayError('invalid_argument', 'a card record naming this relay as home must carry the handle bound to the identity');
+      case 'claim_limited':
+        throw new RelayError('rate_limited', 'this client network has claimed its handles for the day', retryAfter);
+      case 'rate_limited':
+      case 'relay_busy':
+        throw storageRefusal(status);
+      default:
+        throw new RelayError(status);
+    }
+  });
+
+  app.get('/v1/card/:aceId', async (req: FastifyRequest) => {
+    const { aceId } = req.params as { aceId: string };
+    const bundle = isACEId(aceId) ? await cards.get(aceId) : null;
+    if (!bundle) throw new RelayError('unknown_peer');
+    return bundle;
   });
 
   app.get('/v1/handles/:handle', async (req: FastifyRequest) => {
     const { handle } = req.params as { handle: string };
-    if (!isHandle(handle)) throw new RelayError('unknown_peer');
-    const agent = await descriptors.resolveHandle(handle, clock());
-    if (!agent) throw new RelayError('unknown_peer');
-    return agent;
+    const bundle = isHandle(handle) ? await cards.resolveHandle(handle, audience) : null;
+    if (!bundle) throw new RelayError('unknown_peer');
+    return bundle;
   });
 
   app.get('/v1/descriptors', { schema: directorySchema }, async (req: FastifyRequest) => {

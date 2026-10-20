@@ -116,11 +116,11 @@ export function registrationNetworkOf(req: FastifyRequest, config: RelayConfig):
 }
 
 /**
- * Counts a registration or descriptor publication against its registration network (`registrationNetworkOf`):
+ * Counts a registration, descriptor or card publication against its registration network (`registrationNetworkOf`):
  * `REGISTER_RATE_LIMIT` per client network, `TRUSTED_REGISTER_RATE_LIMIT` per trusted network (a hosted service
  * registers for many end users from one egress).
  */
-export async function enforceRegistrationRate(deps: Pick<RouteDeps, 'rateLimiter' | 'config'>, req: FastifyRequest, route: 'register' | 'descriptor'): Promise<void> {
+export async function enforceRegistrationRate(deps: Pick<RouteDeps, 'rateLimiter' | 'config'>, req: FastifyRequest, route: 'register' | 'descriptor' | 'card'): Promise<void> {
   const network = registrationNetworkOf(req, deps.config);
   const limit = network.startsWith('t:') ? deps.config.trustedRegisterRateLimit : deps.config.registerRateLimit;
   await enforceRate(deps.rateLimiter, `${route}:${network}`, limit, 3600, 'network');

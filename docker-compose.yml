@@ -22,7 +22,7 @@ services:
 
   valkey:
     image: valkey/valkey:8
-    command: valkey-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    command: valkey-server --appendonly yes --appendfsync everysec --maxmemory 512mb --maxmemory-policy noeviction
     volumes:
       - valkey-data:/data
     restart: unless-stopped

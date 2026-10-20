@@ -5,7 +5,7 @@
 //
 //    1 register             2 descriptors        3 send               4 inbox            5 listen
 //    6 fp-minimal           7 vectors            8 e2e relay A        9 e2e relay B     10 operations
-//   11 fp-minimal (limits) 12 retention         13 register (rate)   14 directory      15 send (limits)
+//   11 fp-minimal (limits) 12 retention         13 register (rate)   14 cards          15 send (limits)
 //    0 wake
 //
 // The capacity suite owns a whole second instance, ACE_TEST_CAPACITY_REDIS_ORIGIN (default redis://localhost:16380):
@@ -13,9 +13,9 @@
 import Redis from 'ioredis';
 import { vi } from 'vitest';
 import {
-  MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, createAuthHeaders, createDescriptor, createPacket, createPermit,
-  createRegistrationRequest, type DeliveryPermit, type Packet, type PrekeyVault, type PublishedAgent,
-  type RelayAuthRequest,
+  MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, createAuthHeaders, createCardRecord, createDescriptor, createPacket,
+  createPermit, createRegistrationRequest, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
+  type PrekeyVault, type PublishedAgent, type RelayAuthRequest,
 } from '@ace-protocol/sdk';
 import { buildApp, type RelayApp } from '../src/app.js';
 import { parseCidrs, validateConfig, type RelayConfig } from '../src/config.js';
@@ -33,7 +33,7 @@ export function testConfig(overrides: TestOverrides = {}): RelayConfig {
   return validateConfig({
     port: 0, metricsPort: 0, publicRelayUrl: RELAY_URL, redisUrl: '', trustProxy: false,
     ipRateLimit: 100_000, registerRateLimit: 100_000, trustedRegisterRateLimit: 100_000, discoverRateLimit: 100_000, sendRateLimit: 100_000,
-    strangerIpRateLimit: 100_000, strangerRecipientRateLimit: 100_000,
+    strangerIpRateLimit: 100_000, strangerRecipientRateLimit: 100_000, handleClaimsPerNetworkPerDay: 100_000,
     messageTtlSeconds: 604_800, maxInboxEntries: 10_000, maxInboxBytes: 64 * 1024 * 1024,
     maxInboxSenderBytes: 64 * 1024 * 1024, storageHighWaterBytes: 1024 * 1024 * 1024,
     registrationNetworkBytes: 1024 * 1024 * 1024, trustedRegistrationNetworkBytes: 1024 * 1024 * 1024,
@@ -109,11 +109,10 @@ export async function registered(relay: TestRelay): Promise<Agent> {
   return a;
 }
 
-export async function descriptorOf(agent: Agent, o: { visibility?: 'public' | 'private'; handle?: string; relays?: string[]; now?: number; ttl?: number } = {}): Promise<PublishedAgent> {
+export async function descriptorOf(agent: Agent, o: { relays?: string[]; now?: number; ttl?: number } = {}): Promise<PublishedAgent> {
   const pk = (await agent.vault.current())!;
   return createDescriptor(agent.id, {
-    relays: o.relays ?? [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: text.descriptors(),
-    visibility: o.visibility ?? 'private', handle: o.handle, now: o.now, ttl: o.ttl,
+    relays: o.relays ?? [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: text.descriptors(), now: o.now, ttl: o.ttl,
   });
 }
 
@@ -121,11 +120,32 @@ export async function publish(relay: TestRelay, agent: Agent, o: Parameters<type
   return relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: await descriptorOf(agent, o) });
 }
 
-/** Registered and published. */
-export async function published(relay: TestRelay, o: Parameters<typeof descriptorOf>[1] = {}): Promise<Agent> {
+/** Card record options; `home` defaults to RELAY_URL, `contact` to closed, `listed` to false. */
+export interface CardOptions { home?: string; handle?: string; contact?: Contact; listed?: boolean; card?: AgentCard; pay?: string[]; now?: number }
+
+export function cardOf(agent: Agent, o: CardOptions = {}): Promise<CardBundle> {
+  return createCardRecord(agent.id, {
+    home: o.home ?? RELAY_URL, handle: o.handle, contact: o.contact ?? 'closed', listed: o.listed ?? false, card: o.card, pay: o.pay, now: o.now,
+  });
+}
+
+export async function publishCard(relay: TestRelay, agent: Agent, o: CardOptions = {}, remoteAddress?: string) {
+  return postCard(relay, await cardOf(agent, o), remoteAddress);
+}
+
+export function postCard(relay: TestRelay, bundle: unknown, remoteAddress?: string) {
+  return relay.app.inject({ method: 'POST', url: '/v1/card', payload: bundle as object, ...(remoteAddress ? { remoteAddress } : {}) });
+}
+
+/** Registered and published; with any card option (contact, listed, handle) also a card record. */
+export async function published(relay: TestRelay, o: Parameters<typeof descriptorOf>[1] & Pick<CardOptions, 'contact' | 'listed' | 'handle'> = {}): Promise<Agent> {
   const a = await registered(relay);
   const res = await publish(relay, a, o);
   if (res.statusCode !== 200) throw new Error(`publish failed: ${res.body}`);
+  if (o.contact !== undefined || o.listed !== undefined || o.handle !== undefined) {
+    const c = await publishCard(relay, a, { contact: o.contact, listed: o.listed, handle: o.handle, now: o.now });
+    if (c.statusCode !== 200) throw new Error(`card failed: ${c.body}`);
+  }
   return a;
 }
 

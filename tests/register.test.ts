@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createRegistrationRequest } from '@ace-protocol/sdk';
 import {
-  authHeaders, block, createTestRelay, descriptorOf, inbox, newAgent, now, packet, permit, publish, register, registered, send, type TestRelay,
+  authHeaders, block, createTestRelay, descriptorOf, inbox, newAgent, now, packet, permit, publish, publishCard, register, registered, send,
+  type TestRelay,
   RELAY_URL,
 } from './helpers.js';
 
@@ -59,6 +60,10 @@ describe('POST /v1/register', () => {
       const pub = async (a: typeof first.a, remoteAddress: string) =>
         (await limited.app.inject({ method: 'POST', url: '/v1/descriptor', payload: await descriptorOf(a), remoteAddress })).statusCode;
       expect([await pub(first.a, '10.1.2.3'), await pub(second.a, '10.9.9.9'), await pub(first.a, '10.1.2.3')]).toEqual([200, 200, 429]);
+      // card publications: the same attribution, a bucket of their own
+      const card = async (a: typeof first.a, remoteAddress: string, t: number) => (await publishCard(limited, a, { now: t }, remoteAddress)).statusCode;
+      expect([await card(first.a, '10.1.2.3', now()), await card(second.a, '10.9.9.9', now()), await card(first.a, '10.1.2.3', now() + 1)])
+        .toEqual([200, 200, 429]);
     } finally {
       await limited.close();
     }
@@ -83,19 +88,21 @@ describe('POST /v1/register', () => {
 });
 
 describe('POST /v1/unregister', () => {
-  it('deletes queue, descriptor, handle and blocks; keeps the KEL barrier', async () => {
+  it('deletes queue, descriptor, card record and blocks; keeps the KEL barrier and the handle binding', async () => {
     const a = await registered(relay), b = await registered(relay);
-    expect((await publish(relay, a, { visibility: 'public', handle: 'leaver' })).statusCode).toBe(200);
+    expect((await publish(relay, a)).statusCode).toBe(200);
+    expect((await publishCard(relay, a, { contact: 'open', handle: 'leaver' })).statusCode).toBe(200);
     expect((await send(relay, await packet(b, a), await permit(a, b))).statusCode).toBe(200);
     expect((await block(relay, a, b.aceId, true, 1)).statusCode).toBe(200);
 
     const res = await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, now() + 1) });
     expect(res.json()).toEqual({ ok: true });
     const keys = (await relay.redis.keys(`*${a.aceId}*`)).filter((k) => !/^ace:(replay|rate):/.test(k)).sort();
-    expect(keys).toEqual([`ace:descriptor:${a.aceId}`, `ace:horizon:${a.aceId}`, `ace:identity:${a.aceId}`]);
-    expect(await relay.redis.hkeys(`ace:descriptor:${a.aceId}`)).toEqual(expect.arrayContaining(['issuedAt', 'digest']));
-    expect(await relay.redis.hget(`ace:descriptor:${a.aceId}`, 'json')).toBeNull();
-    expect(await relay.redis.exists('ace:handle:leaver')).toBe(0);
+    expect(keys).toEqual([`ace:card:${a.aceId}`, `ace:descriptor:${a.aceId}`, `ace:handleof:${a.aceId}`, `ace:horizon:${a.aceId}`, `ace:identity:${a.aceId}`]);
+    for (const k of [`ace:descriptor:${a.aceId}`, `ace:card:${a.aceId}`]) {
+      expect((await relay.redis.hkeys(k)).sort()).toEqual(['digest', 'issuedAt']);
+    }
+    expect(await relay.redis.get('ace:handle:leaver')).toBe(a.aceId);
     expect((await relay.app.inject({ method: 'GET', url: '/v1/handles/leaver' })).statusCode).toBe(404);
     expect((await inbox(relay, a)).json().error).toBe('not_registered');
     expect((await send(relay, await packet(b, a), await permit(a, b))).json().error).toBe('not_permitted');

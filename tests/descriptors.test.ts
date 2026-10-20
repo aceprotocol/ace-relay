@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayClient, createDescriptor, type JSONObject, type PublishedAgent } from '@ace-protocol/sdk';
 import {
-  RELAY_URL, block, createTestRelay, descriptorOf, newAgent, now, packet, permit, publish, published, register, registered, send, type TestRelay,
+  RELAY_URL, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register, registered, send, type TestRelay,
 } from './helpers.js';
 
 let relay: TestRelay;
@@ -9,7 +9,6 @@ beforeAll(async () => { relay = await createTestRelay(2); });
 afterAll(async () => { await relay.close(); });
 
 const get = (url: string) => relay.app.inject({ method: 'GET', url });
-const resolve = (payload: object) => relay.app.inject({ method: 'POST', url: '/v1/descriptor/resolve', payload });
 
 describe('POST /v1/descriptor', () => {
   it('requires registration, the registered KEL and this relay in relays', async () => {
@@ -27,32 +26,13 @@ describe('POST /v1/descriptor', () => {
     const t = now() - 10;
     const d = await descriptorOf(a, { now: t });
     const tampered = structuredClone(d);
-    tampered.descriptor.visibility = 'public';
+    tampered.descriptor.relays = [RELAY_URL, 'https://elsewhere.test'];
     expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: tampered })).json().error).toBe('invalid_authorization');
     expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: d })).statusCode).toBe(200);
     expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: d })).statusCode).toBe(200); // idempotent
     expect((await publish(relay, a, { now: t - 10 })).json().error).toBe('stale_descriptor');
-    const sameSecond = await descriptorOf(a, { now: t, visibility: 'public' });
+    const sameSecond = await descriptorOf(a, { now: t, relays: [RELAY_URL, 'https://elsewhere.test'] });
     expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: sameSecond })).json().error).toBe('stale_descriptor');
-  });
-
-  it('claims a handle only as the primary relay; a taken handle is refused; private releases it', async () => {
-    const a = await registered(relay), b = await registered(relay), c = await registered(relay);
-    expect((await publish(relay, a, { visibility: 'public', handle: 'alpha' })).statusCode).toBe(200);
-    expect((await get('/v1/handles/alpha')).json().descriptor.aceId).toBe(a.aceId);
-    expect((await publish(relay, b, { visibility: 'public', handle: 'alpha', now: now() + 1 })).json().error).toBe('handle_taken');
-    // Not relays[0]: stored, handle not claimed.
-    expect((await publish(relay, c, { visibility: 'public', handle: 'gamma', relays: ['https://primary.test', RELAY_URL] })).statusCode).toBe(200);
-    expect((await get('/v1/handles/gamma')).statusCode).toBe(404);
-    expect((await get(`/v1/descriptor/${c.aceId}`)).statusCode).toBe(200);
-    // Renaming releases the old handle; going private releases everything.
-    expect((await publish(relay, a, { visibility: 'public', handle: 'alpha2', now: now() + 2 })).statusCode).toBe(200);
-    expect((await get('/v1/handles/alpha')).statusCode).toBe(404);
-    expect((await publish(relay, b, { visibility: 'public', handle: 'alpha', now: now() + 3 })).statusCode).toBe(200);
-    expect((await publish(relay, a, { now: now() + 4 })).statusCode).toBe(200);
-    expect((await get('/v1/handles/alpha2')).statusCode).toBe(404);
-    expect((await get(`/v1/descriptor/${a.aceId}`)).statusCode).toBe(404);
-    expect(await relay.redis.zscore('ace:descriptors', a.aceId)).toBeNull();
   });
 });
 
@@ -67,7 +47,7 @@ describe('depth (02 § JSON values)', () => {
     // ext (depth 2) → x:deep:1 (3) → 29 more levels: depth 32
     const ok = await createDescriptor(a.id, {
       relays: [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: [{ id: 'x:deep:1', digest: 'a'.repeat(64) }],
-      visibility: 'public', ext: { 'x:deep:1': nest(29) },
+      ext: { 'x:deep:1': nest(29) },
     });
     const over: PublishedAgent = structuredClone(ok);
     over.descriptor.ext = { 'x:deep:1': nest(30) };
@@ -75,6 +55,7 @@ describe('depth (02 § JSON values)', () => {
     expect(refused.statusCode).toBe(401);
     expect(refused.json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringMatching(/depth 32/) });
     expect((await post(ok)).statusCode).toBe(200);
+    expect((await publishCard(relay, a, { listed: true })).statusCode).toBe(200);
 
     const page = await get('/v1/descriptors?profile=x%3Adeep%3A1');
     const client = new RelayClient(RELAY_URL, { fetch: async () => new Response(page.body, { status: 200, headers: { 'content-type': 'application/json' } }) });
@@ -90,69 +71,6 @@ describe('depth (02 § JSON values)', () => {
         : await send(relay, deep);
       expect(res.statusCode).toBe(400);
       expect(res.json().error).toBe('invalid_packet');
-    }
-  });
-});
-
-describe('lookups', () => {
-  it('GET /v1/descriptor/{aceId} serves only public, unexpired descriptors of active identities', async () => {
-    const pub = await published(relay, { visibility: 'public' });
-    const priv = await published(relay);
-    expect((await get(`/v1/descriptor/${pub.aceId}`)).json().descriptor.aceId).toBe(pub.aceId);
-    expect((await get(`/v1/descriptor/${priv.aceId}`)).json().error).toBe('unknown_peer');
-    expect((await get('/v1/descriptor/not-an-id')).statusCode).toBe(404);
-    await relay.redis.hset(`ace:descriptor:${pub.aceId}`, 'expiresAt', String(now() - 1));
-    expect((await get(`/v1/descriptor/${pub.aceId}`)).statusCode).toBe(404);
-  });
-
-  it('POST /v1/descriptor/resolve returns private descriptors for a valid, unblocked permit', async () => {
-    const target = await published(relay);
-    const holder = await newAgent(); // need not be registered
-    const p = await permit(target, holder);
-    const ok = await resolve({ aceId: target.aceId, permit: p });
-    expect(ok.statusCode).toBe(200);
-    expect(ok.json().descriptor).toMatchObject({ aceId: target.aceId, visibility: 'private' });
-
-    const other = await registered(relay);
-    expect((await resolve({ aceId: other.aceId, permit: p })).json().error).toBe('unknown_peer'); // issuer != aceId
-    expect((await resolve({ aceId: target.aceId, permit: { ...p, subject: other.aceId } })).json().error).toBe('unknown_peer');
-    expect((await resolve({ aceId: target.aceId, permit: await permit(target, holder, { now: now() - 100, ttl: 50 }) })).json().error).toBe('unknown_peer');
-    expect((await resolve({ aceId: target.aceId })).json().error).toBe('invalid_argument');
-    expect((await resolve({ aceId: target.aceId, permit: p, extra: 1 })).json().error).toBe('invalid_argument');
-    expect((await block(relay, target, holder.aceId, true, 1)).statusCode).toBe(200);
-    expect((await resolve({ aceId: target.aceId, permit: p })).json().error).toBe('unknown_peer');
-    expect((await block(relay, target, holder.aceId, false, 2)).statusCode).toBe(200);
-    expect((await resolve({ aceId: target.aceId, permit: p })).statusCode).toBe(200);
-    // A signing-key change at the issuer invalidates its earlier permits.
-    await target.id.delegate();
-    await register(relay, target, now() + 1);
-    expect((await resolve({ aceId: target.aceId, permit: p })).json().error).toBe('unknown_peer');
-  });
-});
-
-describe('GET /v1/descriptors', () => {
-  it('lists public descriptors by ACE ID, filtered by profile, paged with a cursor', async () => {
-    const dir = await createTestRelay(14);
-    try {
-      const agents = [];
-      for (let i = 0; i < 5; i++) {
-        const a = await registered(dir);
-        expect((await publish(dir, a, { visibility: i === 4 ? 'private' : 'public' })).statusCode).toBe(200);
-        if (i < 4) agents.push(a.aceId);
-      }
-      agents.sort();
-      const page1 = (await dir.app.inject({ method: 'GET', url: '/v1/descriptors?limit=3' })).json();
-      expect(page1.agents.map((x: any) => x.descriptor.aceId)).toEqual(agents.slice(0, 3));
-      expect(page1.cursor).toBe(agents[2]);
-      const page2 = (await dir.app.inject({ method: 'GET', url: `/v1/descriptors?limit=3&cursor=${page1.cursor}` })).json();
-      expect(page2).toMatchObject({ cursor: null });
-      expect(page2.agents.map((x: any) => x.descriptor.aceId)).toEqual(agents.slice(3));
-      expect((await dir.app.inject({ method: 'GET', url: '/v1/descriptors?profile=ace:text:1' })).json().agents).toHaveLength(4);
-      expect((await dir.app.inject({ method: 'GET', url: '/v1/descriptors?profile=ace:commerce:1' })).json()).toEqual({ agents: [], cursor: null });
-      expect((await dir.app.inject({ method: 'GET', url: '/v1/descriptors?limit=0' })).json().error).toBe('invalid_argument');
-      expect((await dir.app.inject({ method: 'GET', url: '/v1/descriptors?cursor=x' })).json().error).toBe('invalid_argument');
-    } finally {
-      await dir.close();
     }
   });
 });

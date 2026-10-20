@@ -1,13 +1,14 @@
 # ACE Relay
 
 Store-and-forward relay for the ACE protocol. It registers identities (their KEL), serves their signed
-descriptors, and queues opaque prekey-encrypted packets for registered recipients. It never sees plaintext, never
-verifies packet signatures and is untrusted by design: clients verify every KEL, descriptor and packet themselves.
+descriptors and card records, binds handles, and queues opaque prekey-encrypted packets for registered recipients. It
+never sees plaintext, never verifies packet signatures and is untrusted by design: clients verify every KEL,
+descriptor, card record and packet themselves.
 The public deployment is `https://relay.aceprotocol.org`.
 
 The HTTP binding is normative in [`ace-spec/07-relay.md`](../ace-spec/07-relay.md) (its OpenAPI rendering,
 `openapi.yaml`, lives only in ace-spec). Every protocol rule comes from `@ace-protocol/sdk` (`verifyRegistrationRequest`,
-`verifyPublishedAgent`, `verifyPermit`, `decodePacket`, `checkPacketTime`, `parseAuthHeaders` / `verifyAuthHeaders`,
+`verifyPublishedAgent`, `verifyCardBundle`, `verifyPermit`, `decodePacket`, `checkPacketTime`, `parseAuthHeaders` / `verifyAuthHeaders`,
 `verifyKel` / `extendKel`, `networkKey` and the limit constants). `tests/e2e.test.ts` runs the SDK `NetworkClient`
 between identities through one relay and across two; `tests/vectors.test.ts` replays ace-spec's `auth.negative` and
 `auth.registration.negative` vectors through the HTTP routes.
@@ -22,12 +23,13 @@ request and derive the keys named by stored state (`src/store/keyspace.ts`).
 | `POST /v1/register` | body signature | RegistrationRequest | `{ok, status: registered\|idempotent\|refreshed\|rotated}` |
 | `POST /v1/unregister` | `unregister` | — | `{ok}` |
 | `POST /v1/descriptor` | descriptor signature | PublishedAgent | `{ok}` |
-| `GET /v1/descriptor/{aceId}` | — | — | public PublishedAgent |
-| `POST /v1/descriptor/resolve` | permit | `{aceId, permit}` | PublishedAgent (private too) |
-| `GET /v1/handles/{handle}` | — | — | public PublishedAgent |
-| `GET /v1/descriptors?profile&cursor&limit` | — | — | `{agents, cursor}` |
+| `GET /v1/descriptor/{aceId}` | — | — | PublishedAgent |
+| `POST /v1/card` | card record signature | CardBundle | `{ok}` |
+| `GET /v1/card/{aceId}` | — | — | CardBundle |
+| `GET /v1/handles/{handle}` | — | — | CardBundle |
+| `GET /v1/descriptors?profile&cursor&limit` | — | — | `{agents, cursor}` (listed identities) |
 | `POST /v1/blocks` | `block` | `{peer, blocked, revision}` | `{ok}` |
-| `POST /v1/send` | permit or public recipient | `{packet, permit?}` | `{ok}` |
+| `POST /v1/send` | permit or `contact: open` recipient | `{packet, permit?}` | `{ok}` |
 | `PUT /v1/wake` | `wake` | `{gateway, token}` | `{ok}` (only with `WAKE_GATEWAYS`) |
 | `DELETE /v1/wake` | `wake` | — | `{ok}` (only with `WAKE_GATEWAYS`) |
 | `GET /v1/inbox?since&limit` | `inbox` | — | `{messages: [{streamId, packet}], cursor}` |
@@ -46,17 +48,41 @@ Any other route is `404 {"error":"not_found"}`. `GET /metrics` (Prometheus text:
 
 **Descriptors.** `POST /v1/descriptor` verifies the PublishedAgent, requires its KEL to be the registered KEL
 (`not_registered`, `kel_conflict`), its `relays` to include this relay's public URL, and a newer `issuedAt`
-(`stale_descriptor`; equal with identical claims is idempotent). A public handle is claimed only when this relay is
-`relays[0]` (`handle_taken` if another identity holds it); it expires with the descriptor. The stored document's
-bytes are charged to the identity's registration network (below; `429 rate_limited`). Publishing `private`
-removes the directory entry and handle atomically. Lookups return only complete signed documents of active
-identities, never merged metadata. `POST /v1/descriptor/resolve` needs no registration: any permit failure, an expired
-descriptor or a blocked subject is `unknown_peer`. The directory is ordered by ACE ID, at most 100 agents and 8 MiB
+(`stale_descriptor`; equal with identical claims is idempotent). The stored document's bytes are charged to the
+identity's registration network (below; `429 rate_limited`). `GET /v1/descriptor/{aceId}` serves the unexpired
+descriptor of any registered identity. Lookups return only complete signed documents of active identities, never
+merged metadata.
+
+**Card records and handles.** `POST /v1/card` verifies the CardBundle (`verifyCardBundle`), requires its KEL to be the
+registered KEL (`not_registered`, `kel_conflict`) and a newer `issuedAt` (`stale_descriptor`; equal with identical
+claims is idempotent), counts against `REGISTER_RATE_LIMIT` in a bucket of its own, and charges the stored bytes like
+a descriptor. Handles are **set once, per home**, in the same script as the record (`src/store/cards.ts`):
+
+- a record whose `home` is another relay is stored but claims nothing here; a handle already bound here stays bound;
+- when `home` is this relay and a handle is bound to the identity here, the record must carry exactly that handle
+  (omitting it or naming another is `400 invalid_argument`);
+- otherwise a record at home naming a handle binds it permanently (`409 handle_taken` if another identity holds it).
+  New bindings are limited to `HANDLE_CLAIMS_PER_NETWORK_PER_DAY` (8) per client network (`429 rate_limited`, with
+  `Retry-After`).
+
+A binding (`ace:handle:<h>` → ACE ID, `ace:handleof:<id>` → handle) has no TTL and is never released: not by a new
+record, not by moving `home`, not by unregister. `GET /v1/handles/{handle}` serves the bound identity's stored
+CardBundle only while that record names this relay as `home` and carries the handle, else `unknown_peer`.
+`GET /v1/card/{aceId}` serves the stored record of a registered identity, also one signed under a since-rotated KEL
+(clients verify it; the agent re-signs after a `dlg`). The directory lists identities whose stored record names this
+relay as `home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most 100 agents and 8 MiB
 per page, scanning at most 1000 entries; continue until `cursor: null`.
+
+**Permanent names and squatting.** Because a handle is never reassigned, a name claimed by an identity that is later
+abandoned stays unusable for everyone. That is the price of handles nobody can take over. The relay bounds it with
+`HANDLE_CLAIMS_PER_NETWORK_PER_DAY` per client network, plus the registration rate and byte budgets every claim also
+passes. The spec also lets a relay reserve handles under a naming policy (answered `handle_taken`). This relay does not
+implement such a policy yet; it is the place for a future operator hook (reserved or offensive names, trademark
+disputes).
 
 **Blocks.** Signed `{peer, blocked, revision}` with a strictly increasing revision per peer (`stale_revision`), kept
 after an unblock; at most 1024 tracked peers per identity (`limit_exceeded`). A block wins over any permit at
-`/v1/send` and at `/v1/descriptor/resolve`.
+`/v1/send`.
 
 **Send.** In order: decode the packet (`invalid_packet`, `unsupported_version`) and require
 `now − OFFLINE_WINDOW_SECONDS ≤ timestamp ≤ now + TIMESTAMP_WINDOW_SECONDS` (`stale_timestamp`); a byte-identical
@@ -67,12 +93,12 @@ enters the **normal queue**:
 retained `MESSAGE_TTL_SECONDS` (default `OFFLINE_WINDOW_SECONDS`), bounded per recipient by `MAX_INBOX_ENTRIES` and
 `MAX_INBOX_BYTES`, with at most `MAX_INBOX_SENDER_BYTES` per (recipient, sender) (`recipient_inbox_full`), and
 rate-limited per (recipient, sender). Without a permit the recipient must be
-registered with an unexpired public descriptor here: the packet enters the **stranger allowance**, at most
+registered here with a stored card record that is `contact: open` and an unexpired descriptor: the packet enters the **stranger allowance**, at most
 `STRANGER_ALLOWANCE` (16) entries per recipient, each retained `CONTACT_REQUEST_TTL_SECONDS` (86,400 s), of which one
 client network holds at most `STRANGER_NETWORK_ALLOWANCE` (2) (`recipient_inbox_full`, with `Retry-After`), and
-rate-limited per client network and per recipient. Unknown, unregistered, non-public and blocking recipients and bad permits all answer
-the same `403 {"error":"not_permitted","message":"not permitted"}`, so `/v1/send` cannot enumerate private agents or
-block lists. The relay-wide capacity limit (below) answers `429 rate_limited` with `Retry-After`. Both kinds share the recipient's stream; listeners are then notified. Retries of one
+rate-limited per client network and per recipient. Unknown, unregistered, `closed` or card-less and blocking recipients and bad permits all answer
+the same `403 {"error":"not_permitted","message":"not permitted"}`, so `/v1/send` cannot enumerate who takes contact
+requests or block lists. The relay-wide capacity limit (below) answers `429 rate_limited` with `Retry-After`. Both kinds share the recipient's stream; listeners are then notified. Retries of one
 message are re-encrypted and therefore distinct packets; receivers deduplicate by `(from, messageId)`.
 
 **Inbox.** Reads never delete. `POST /v1/inbox/ack?through=<streamId>` deletes entries up to and including it
@@ -102,10 +128,10 @@ bytes are charged to the registering network's byte budget (`429 rate_limited` w
 same timestamp and digest → `idempotent`; newer timestamp, same last event → `refreshed`; extended or recovered KEL →
 `rotated`; strict prefix → `stale_seq`; fork → `kel_conflict`; older timestamp, equal timestamp with another digest,
 or at or below the unregister barrier → `identity_conflict`. `unregister` needs an auth timestamp newer than the
-registration; it deletes queue, descriptor document, handle, directory entry, blocks and wake registration atomically and closes listen
-streams. The KEL, the descriptor's newest `issuedAt`/digest and the barrier are kept for `OFFLINE_WINDOW_SECONDS`
+registration; it deletes queue, descriptor and card record documents, directory entry, blocks and wake registration atomically and closes listen
+streams; the handle binding stays. The KEL, the descriptor's and card record's newest `issuedAt`/digest and the barrier are kept for `OFFLINE_WINDOW_SECONDS`
 (their keys expire then), so a re-registration within that period must extend that history (or recover it, 01 rule
-6). A fixed-size **horizon** stays forever (`ace:horizon:<id>`): the barrier, the descriptor's `issuedAt`/digest, the
+6). A fixed-size **horizon** stays forever (`ace:horizon:<id>`): the barrier, the descriptor's and card record's `issuedAt`/digest, the
 seq and hash of the KEL's last root-epoch event (its last `icp` or `rot`) and of its last event. After the KEL expired,
 a registration must carry that epoch event (`kel_conflict`) and either carry the last event (an extension) or hold a
 `rot` after the epoch start, which only the holder of the committed next root can sign (recovery); otherwise it is
@@ -126,17 +152,18 @@ Superseded keys therefore cannot roll the identity back here.
 | `REDIS_URL_FILE` | unset | file holding the Redis URL (preferred in deploy); must be 0400/0600; not together with `REDIS_URL` |
 | `TRUST_PROXY` | unset (false) | proxy IP/CIDR list whose `X-Forwarded-For` is trusted; hop counts are rejected, and so is `true` (trust every peer) with `NODE_ENV=production` |
 | `IP_RATE_LIMIT` | 600/min | per fine client network (IPv4 address, IPv6 /64), every `/v1` route |
-| `REGISTER_RATE_LIMIT` | 20/h | registrations, and separately descriptor publications, per registration network (the client network, unless trusted) |
-| `TRUSTED_REGISTER_RATE_LIMIT` | 2000/h | the same two limits for each `TRUSTED_REGISTRATION_NETWORKS` CIDR (one bucket per CIDR, shared by every identity a hosted service registers from it) |
+| `REGISTER_RATE_LIMIT` | 20/h | registrations, and separately descriptor and card publications, per registration network (the client network, unless trusted) |
+| `TRUSTED_REGISTER_RATE_LIMIT` | 2000/h | the same three limits for each `TRUSTED_REGISTRATION_NETWORKS` CIDR (one bucket per CIDR, shared by every identity a hosted service registers from it) |
 | `DISCOVER_RATE_LIMIT` | 30/min | directory reads per fine client network |
 | `SEND_RATE_LIMIT` | 120/min | permitted sends per (recipient, sender) |
 | `STRANGER_IP_RATE_LIMIT` | 30/h | permit-less sends per client network |
 | `STRANGER_RECIPIENT_RATE_LIMIT` | 60/h | permit-less sends per recipient |
+| `HANDLE_CLAIMS_PER_NETWORK_PER_DAY` | 8/day | new handle bindings per client network (IPv4 /24, IPv6 /56), trusted networks included; 02 sets 8 |
 | `MESSAGE_TTL_SECONDS` | 604800 | normal queue retention; must be 86400..604800 (`OFFLINE_WINDOW_SECONDS`) |
 | `MAX_INBOX_ENTRIES` | 10000 | normal queue bound per recipient, entries |
 | `MAX_INBOX_BYTES` | 24 MiB | normal queue bound per recipient, packet bytes (≥ `MAX_PACKET_BYTES`) |
 | `MAX_INBOX_SENDER_BYTES` | 8 MiB | normal queue share per (recipient, sender), packet bytes (≥ `MAX_PACKET_BYTES`) |
-| `REGISTRATION_NETWORK_BYTES` | 96 MiB | byte budget of one client network: the stored KELs and descriptors of the identities registered from it, the KELs of identities retired from it (for the packet window), and the packets queued for them; a registration, publication or send over it gets `429 rate_limited` |
+| `REGISTRATION_NETWORK_BYTES` | 96 MiB | byte budget of one client network: the stored KELs, descriptors and card records of the identities registered from it, the KELs of identities retired from it (for the packet window), and the packets queued for them; a registration, publication or send over it gets `429 rate_limited` |
 | `TRUSTED_REGISTRATION_NETWORKS` | unset | comma-separated CIDRs of operator-known registration egress; each listed CIDR is one network with the larger budget below and `TRUSTED_REGISTER_RATE_LIMIT`. For the hosted MCP this is the **docker bridge subnet it reaches the relay from** (`docker network inspect relay-network --format '{{(index .IPAM.Config 0).Subnet}}'`). Attribution: a registration the MCP triggers from a tool call carries the end user's forwarded IP (`X-Forwarded-For` through the proxy) and is charged to that user's client network; one its background worker triggers (descriptor renewal, re-registration) comes from the bridge subnet and is charged to the trusted network. **The hosted MCP deployment must set it**, or all its worker-triggered registrations share one client network's 96 MiB and 20/h |
 | `TRUSTED_REGISTRATION_NETWORK_BYTES` | 256 MiB | budget of each trusted registration network |
 | `STORAGE_HIGH_WATER_BYTES` | 384 MiB | relay-wide capacity: the store's **total** used memory (Valkey `used_memory`: identities, KELs, descriptors, horizons, queues, control keys and server overhead) at which registration, descriptor publication and send stop growing it (`429 rate_limited`, `Retry-After: 60`) and `/health` turns 503; set it below Valkey `maxmemory` with a reserve for control writes (default sized for 512 MiB) |
@@ -202,6 +229,10 @@ and directory reads use the fine network (IPv4 address, IPv6 /64).
   of the request rate over their windows) and one in-flight write per connection (at most `MAX_PACKET_BYTES` each);
   use `noeviction` (eviction would silently drop identities and queues). The default 384 MiB mark leaves 128 MiB of a
   512 MiB `maxmemory`.
+- **Persistence is required.** Handle bindings and card records are permanent data (no TTL): a handle bound once must
+  stay bound to its identity forever, and losing the store would let anyone claim it again. Run Valkey with
+  `appendonly yes` and `appendfsync everysec` (the bundled `docker-compose.yml` enables AOF; everysec is Valkey's
+  default fsync policy) on a persistent volume, and back the AOF up. An RDB-only or memory-only store is not enough.
 - **One Valkey per service.** The relay and the MCP service must use separate Valkey instances with separate
   credentials (the deployment's `relay-valkey` serves only the relay). Under `noeviction` a shared instance lets one
   service's writes exhaust the other's memory, and a shared credential lets either read or flush the other's data.

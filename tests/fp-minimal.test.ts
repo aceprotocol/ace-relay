@@ -4,7 +4,7 @@ import {
   MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, SoftwareIdentity, SoftwareKey, createPermit, createRegistrationRequest, fromBase64,
 } from '@ace-protocol/sdk';
 import {
-  RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, published, register, send,
+  RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, published, register, send,
   type Agent, type TestRelay,
 } from './helpers.js';
 import { REGNET_STORED_KEY_PREFIX } from '../src/store/keyspace.js';
@@ -19,7 +19,7 @@ const registerFrom = async (r: TestRelay, agent: Agent, remoteAddress: string, t
 
 describe('A7 stranger allowance', () => {
   it('stranger network cap 2 per recipient', async () => {
-    const to = await published(relay, { visibility: 'public' });
+    const to = await published(relay, { contact: 'open' });
     expect((await send(relay, await packet(await newAgent(), to), undefined, '203.0.113.1')).statusCode).toBe(200);
     expect((await send(relay, await packet(await newAgent(), to), undefined, '203.0.113.2')).statusCode).toBe(200);
     const full = await send(relay, await packet(await newAgent(), to), undefined, '203.0.113.3');
@@ -33,7 +33,7 @@ describe('A7 stranger allowance', () => {
   it('blocked stranger does not consume allowance', async () => {
     const r = await createTestRelay(11, { strangerIpRateLimit: 1, strangerRecipientRateLimit: 1 });
     try {
-      const to = await published(r, { visibility: 'public' }), blocked = await newAgent();
+      const to = await published(r, { contact: 'open' }), blocked = await newAgent();
       expect((await block(r, to, blocked.aceId, true, 1)).statusCode).toBe(200);
       for (let i = 0; i < 3; i++) {
         expect((await send(r, await packet(blocked, to), undefined, '203.0.113.9')).json()).toEqual({ error: 'not_permitted', message: 'not permitted' });
@@ -66,7 +66,8 @@ describe('A10 storage bounds', () => {
       expect(refused.statusCode).toBe(429);
       expect(refused.json().error).toBe('rate_limited');
       expect(refused.headers['retry-after']).toMatch(/^[0-9]+$/);
-      expect((await publish(r, a, { now: now() + 1, visibility: 'public', handle: 'biggerhandle' })).json().error).toBe('rate_limited');
+      expect((await publish(r, a, { now: now() + 1, relays: [RELAY_URL, 'https://second.test'] })).json().error).toBe('rate_limited');
+      expect((await publishCard(r, a, { card: { name: 'a card' } })).json().error).toBe('rate_limited');
       // Other networks are unaffected.
       expect((await registerFrom(r, b, '198.51.100.8')).statusCode).toBe(200);
       expect((await publish(r, b)).statusCode).toBe(200);
@@ -81,12 +82,12 @@ describe('A10 storage bounds', () => {
     }
   });
 
-  it('retired identity: KEL and descriptor expire after OFFLINE_WINDOW, the anti-rollback horizon stays', async () => {
-    const a = await published(relay, { visibility: 'public', handle: 'retiree' });
+  it('retired identity: KEL, descriptor and card record expire after OFFLINE_WINDOW, the anti-rollback horizon stays', async () => {
+    const a = await published(relay, { contact: 'open', handle: 'retiree' });
     const t = now();
     const un = await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, t + 1) });
     expect(un.statusCode).toBe(200);
-    for (const key of [`ace:identity:${a.aceId}`, `ace:descriptor:${a.aceId}`]) {
+    for (const key of [`ace:identity:${a.aceId}`, `ace:descriptor:${a.aceId}`, `ace:card:${a.aceId}`]) {
       const ttl = await relay.redis.ttl(key);
       expect(ttl).toBeGreaterThan(OFFLINE_WINDOW_SECONDS - 10);
       expect(ttl).toBeLessThanOrEqual(OFFLINE_WINDOW_SECONDS);
@@ -98,14 +99,19 @@ describe('A10 storage bounds', () => {
     expect((await register(relay, a, t + 2)).json()).toEqual({ ok: true, status: 'registered' });
     expect(await relay.redis.ttl(`ace:identity:${a.aceId}`)).toBe(-1);
     expect(await relay.redis.ttl(`ace:descriptor:${a.aceId}`)).toBe(-1);
-    // After the window (the byte-heavy keys expired) the barrier and the descriptor horizon still hold.
+    expect(await relay.redis.ttl(`ace:card:${a.aceId}`)).toBe(-1);
+    // After the window (the byte-heavy keys expired) the barrier and the descriptor and card horizons still hold.
     const un2 = await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, t + 3) });
     expect(un2.statusCode).toBe(200);
-    await relay.redis.del(`ace:identity:${a.aceId}`, `ace:descriptor:${a.aceId}`);
+    await relay.redis.del(`ace:identity:${a.aceId}`, `ace:descriptor:${a.aceId}`, `ace:card:${a.aceId}`);
     expect((await register(relay, a, t + 3)).json().error).toBe('identity_conflict');
     expect((await register(relay, a, t + 4)).json()).toEqual({ ok: true, status: 'registered' });
     expect((await publish(relay, a, { now: t - 60 })).json().error).toBe('stale_descriptor');
     expect((await publish(relay, a, { now: t + 4 })).statusCode).toBe(200);
+    expect((await publishCard(relay, a, { handle: 'retiree', now: t - 60 })).json().error).toBe('stale_descriptor');
+    // The handle binding outlived it all.
+    expect((await publishCard(relay, a, { now: t + 4 })).json().error).toBe('invalid_argument');
+    expect((await publishCard(relay, a, { handle: 'retiree', now: t + 4 })).statusCode).toBe(200);
   });
 
   const expire = (aceId: string) => relay.redis.del(`ace:identity:${aceId}`, `ace:descriptor:${aceId}`);
@@ -184,14 +190,11 @@ describe('A6 the permit issuer must be usable now', () => {
       expect((await register(r, issuer, t0)).statusCode).toBe(200);
       expect((await publish(r, issuer, { now: t0 })).statusCode).toBe(200);
       const p = await createPermit(issuer.id, from.aceId, { now: t0 });
-      const resolve = () => r.app.inject({ method: 'POST', url: '/v1/descriptor/resolve', payload: { aceId: issuer.aceId, permit: p } });
       clock = t0 + 50;
       expect((await send(r, await packet(from, issuer), p)).statusCode).toBe(200);
-      expect((await resolve()).statusCode).toBe(200);
       // Past the issuer's delegation notAfter the permit no longer admits anyone (01 rule 5).
       clock = t0 + 101;
       expect((await send(r, await packet(from, issuer), p)).json()).toEqual({ error: 'not_permitted', message: 'not permitted' });
-      expect((await resolve()).json().error).toBe('unknown_peer');
     } finally {
       await r.close();
     }

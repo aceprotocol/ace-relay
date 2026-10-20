@@ -2,7 +2,7 @@ import type Redis from 'ioredis';
 import { OFFLINE_WINDOW_SECONDS, isACEId, sha256Hex, type KelEvent } from '@ace-protocol/sdk';
 import { RelayError } from '../errors.js';
 import {
-  BLOCKS_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, HANDLE_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
+  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
   queueKeys,
 } from './keyspace.js';
 import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, RUNS_WHEN_FULL, budgetArgs, type ByteBudget } from './lua.js';
@@ -23,8 +23,8 @@ export interface StoredIdentity {
 /**
  * The permanent anti-rollback record of an unregistered identity, kept after its KEL expired (fixed size): the
  * registration barrier, the seq and hash of the KEL's last root-epoch event (its last `icp` or `rot`) and of its last
- * event. A registration is checked against it in the register route; the descriptor horizon is restored on
- * re-registration.
+ * event. A registration is checked against it in the register route; the descriptor and card record horizons are
+ * restored on re-registration.
  */
 export interface Horizon {
   retiredAt: number;
@@ -75,8 +75,8 @@ function parseIdentityHash(aceId: string, d: Record<string, string>): StoredIden
   };
 }
 
-// KEYS: identity, descriptor, horizon. ARGV: kel, seq, lastHash, signingPublicKey, timestamp, requestDigest, expected lastHash,
-// expected requestDigest, network, then the ByteBudget. The KEL's bytes (and a stored descriptor's) are charged to the
+// KEYS: identity, descriptor, horizon, card. ARGV: kel, seq, lastHash, signingPublicKey, timestamp, requestDigest, expected
+// lastHash, expected requestDigest, network, then the ByteBudget. The KEL's bytes (and a stored descriptor's and card record's) are charged to the
 // network registered from; a registration over its budget (`rate_limited`), or one that grows the store at the
 // high-water mark (`relay_busy`), is refused. A retired identity's KEL charge already lapses with the packet window
 // (see unregister), so a re-registration charges it afresh.
@@ -103,7 +103,8 @@ elseif ARGV[7] ~= '' or ARGV[8] ~= '' then
   return 'retry'
 end
 local rn, kb = ARGV[9], #ARGV[1]
-local jb = tonumber(redis.call('HGET', KEYS[2], 'jb') or '0')
+-- A stored descriptor and card record (jb: their json bytes; both are deleted at unregister).
+local jb = tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') + tonumber(redis.call('HGET', KEYS[4], 'jb') or '0')
 -- Block records (bb) and the wake registration (wb) belong to an active identity only (unregister deletes them).
 local bb, wb = 0, 0
 if active then
@@ -123,34 +124,39 @@ redis.call('HSET', KEYS[1], 'kel', ARGV[1], 'seq', ARGV[2], 'lastHash', ARGV[3],
 redis.call('HDEL', KEYS[1], 'retiredAt')
 redis.call('PERSIST', KEYS[1])
 redis.call('PERSIST', KEYS[2])
--- The descriptor horizon outlives an expired descriptor record.
+redis.call('PERSIST', KEYS[4])
+-- The descriptor and card record horizons outlive their expired records.
 local issuedAt = redis.call('HGET', KEYS[3], 'issuedAt')
 if issuedAt and redis.call('HEXISTS', KEYS[2], 'issuedAt') == 0 then
   redis.call('HSET', KEYS[2], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[3], 'digest'))
 end
+local cardIssuedAt = redis.call('HGET', KEYS[3], 'cardIssuedAt')
+if cardIssuedAt and redis.call('HEXISTS', KEYS[4], 'issuedAt') == 0 then
+  redis.call('HSET', KEYS[4], 'issuedAt', cardIssuedAt, 'digest', redis.call('HGET', KEYS[3], 'cardDigest'))
+end
 return status
 `;
 
-// KEYS: identity, descriptor, directory, blocks, inbox, inbox-meta, inbox-dedup, inbox-strangers, horizon. ARGV: auth
-// timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
-// It frees far more than the horizon it writes, so it runs even when the store is full. The handle key is derived from the stored descriptor (see keyspace). Deletes queue, descriptor
-// document, handle, directory entry and blocks; keeps the KEL, the descriptor's issuedAt/digest and a retiredAt
-// barrier for OFFLINE_WINDOW_SECONDS, and the fixed-size horizon (Horizon) forever (07 § Registration). The wake
-// registration (derived key) goes too. The descriptor's, blocks' and wake charges are released; the KEL's lapses with
-// the packet window.
+// KEYS: identity, descriptor, directory, blocks, inbox, inbox-meta, inbox-dedup, inbox-strangers, horizon, card. ARGV:
+// auth timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
+// It frees far more than the horizon it writes, so it runs even when the store is full. Deletes queue, descriptor
+// document, card record document, directory entry and blocks; keeps the KEL, the descriptor's and card record's
+// issuedAt/digest and a retiredAt barrier for OFFLINE_WINDOW_SECONDS, and the fixed-size horizon (Horizon) forever
+// (07 § Registration). The handle binding stays forever (07 § Descriptors and cards). The wake registration (derived
+// key) goes too. The descriptor's, card record's, blocks' and wake charges are released; the KEL's lapses with the
+// packet window.
 const UNREGISTER_IDENTITY_SCRIPT = RUNS_WHEN_FULL + IDENTITY_LUA + BYTES_LUA + `
 if not isActive(KEYS[1]) then return 'not_registered' end
 if redis.call('HGET', KEYS[1], 'lastHash') ~= ARGV[3] or redis.call('HGET', KEYS[1], 'requestDigest') ~= ARGV[4] then return 'identity_conflict' end
 if tonumber(ARGV[1]) <= tonumber(redis.call('HGET', KEYS[1], 'registeredAt')) then return 'identity_conflict' end
-local handle = redis.call('HGET', KEYS[2], 'handle') or ''
-if handle ~= '' and redis.call('GET', '${HANDLE_KEY_PREFIX}' .. handle) == ARGV[2] then redis.call('DEL', '${HANDLE_KEY_PREFIX}' .. handle) end
 local rn = redis.call('HGET', KEYS[1], 'regnet')
-charge(rn, -tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') - tonumber(redis.call('HGET', KEYS[1], 'bb') or '0')
-  - tonumber(redis.call('HGET', KEYS[1], 'wb') or '0'))
+charge(rn, -tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') - tonumber(redis.call('HGET', KEYS[10], 'jb') or '0')
+  - tonumber(redis.call('HGET', KEYS[1], 'bb') or '0') - tonumber(redis.call('HGET', KEYS[1], 'wb') or '0'))
 redis.call('HDEL', KEYS[1], 'bb', 'wb')
 redis.call('DEL', '${WAKE_KEY_PREFIX}' .. ARGV[2])
 retire(rn, tonumber(redis.call('HGET', KEYS[1], 'kb') or '0'), tonumber(ARGV[5]), tonumber(ARGV[6]))
-redis.call('HDEL', KEYS[2], 'json', 'handle', 'lastHash', 'jb')
+redis.call('HDEL', KEYS[2], 'json', 'lastHash', 'expiresAt', 'profiles', 'jb')
+redis.call('HDEL', KEYS[10], 'json', 'contact', 'listed', 'jb')
 redis.call('ZREM', KEYS[3], ARGV[2])
 releaseQueue(KEYS[6])
 redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[7], KEYS[8])
@@ -163,7 +169,11 @@ redis.call('HSET', KEYS[9], 'retiredAt', ARGV[1], 'epochSeq', ARGV[10], 'epochSt
   'lastHash', ARGV[3])
 local issuedAt = redis.call('HGET', KEYS[2], 'issuedAt')
 if issuedAt then redis.call('HSET', KEYS[9], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[2], 'digest')) end
-if redis.call('EXISTS', KEYS[2]) == 1 then redis.call('EXPIRE', KEYS[2], ${OFFLINE_WINDOW_SECONDS}) end
+local cardIssuedAt = redis.call('HGET', KEYS[10], 'issuedAt')
+if cardIssuedAt then redis.call('HSET', KEYS[9], 'cardIssuedAt', cardIssuedAt, 'cardDigest', redis.call('HGET', KEYS[10], 'digest')) end
+for _, key in ipairs({KEYS[2], KEYS[10]}) do
+  if redis.call('EXISTS', key) == 1 then redis.call('EXPIRE', key, ${OFFLINE_WINDOW_SECONDS}) end
+end
 return 'removed'
 `;
 
@@ -205,8 +215,8 @@ export class IdentityStore {
 
   constructor(redis: Redis, private readonly budget: ByteBudget) {
     this.redis = redis as ScriptRedis;
-    redis.defineCommand('registerIdentity', { numberOfKeys: 3, lua: REGISTER_IDENTITY_SCRIPT });
-    redis.defineCommand('unregisterIdentity', { numberOfKeys: 9, lua: UNREGISTER_IDENTITY_SCRIPT });
+    redis.defineCommand('registerIdentity', { numberOfKeys: 4, lua: REGISTER_IDENTITY_SCRIPT });
+    redis.defineCommand('unregisterIdentity', { numberOfKeys: 10, lua: UNREGISTER_IDENTITY_SCRIPT });
   }
 
   /** The active registration, or null. */
@@ -240,14 +250,14 @@ export class IdentityStore {
   /** Atomic ordered write of the identity (07 § Registration). */
   register(w: RegistrationWrite): Promise<RegistrationStatus> {
     return this.redis.registerIdentity(
-      identityKey(w.aceId), DESCRIPTOR_KEY_PREFIX + w.aceId, HORIZON_KEY_PREFIX + w.aceId,
+      identityKey(w.aceId), DESCRIPTOR_KEY_PREFIX + w.aceId, HORIZON_KEY_PREFIX + w.aceId, CARD_KEY_PREFIX + w.aceId,
       JSON.stringify(w.kel), String(w.seq), w.lastHash, w.signingPublicKey, String(w.timestamp), w.requestDigest,
       w.expectedLastHash ?? '', w.expectedRequestDigest ?? '', w.network, ...budgetArgs(this.budget),
     );
   }
 
   /**
-   * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor document, handle, blocks and wake in one
+   * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor and card record documents, blocks and wake in one
    * script; the KEL and a retiredAt barrier remain for OFFLINE_WINDOW_SECONDS, the horizon (`epoch`: the KEL's last
    * root epoch event and its last seq; its last hash is `expectedLastHash`) forever.
    */
@@ -255,7 +265,7 @@ export class IdentityStore {
     epoch: { epochSeq: number; epochStartHash: string; lastSeq: number }): Promise<UnregisterStatus> {
     return this.redis.unregisterIdentity(
       identityKey(aceId), DESCRIPTOR_KEY_PREFIX + aceId, DIRECTORY_KEY, BLOCKS_KEY_PREFIX + aceId, ...queueKeys(aceId),
-      HORIZON_KEY_PREFIX + aceId,
+      HORIZON_KEY_PREFIX + aceId, CARD_KEY_PREFIX + aceId,
       String(signedTimestamp), aceId, expectedLastHash, expectedRequestDigest, ...budgetArgs(this.budget),
       String(epoch.epochSeq), epoch.epochStartHash, String(epoch.lastSeq),
     );
