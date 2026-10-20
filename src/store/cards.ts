@@ -78,6 +78,8 @@ export interface CardWrite {
   digest: string;
   /** Whether the record's `home` is this relay. */
   atHome: boolean;
+  /** Whether this relay binds handles (its public URL has no path); when not, a record's handle claims nothing here. */
+  bindsHandles: boolean;
   /** The client network the request came from (claim counting). */
   network: string;
 }
@@ -93,7 +95,8 @@ export class CardStore {
 
   async publish(w: CardWrite): Promise<{ status: CardPublishStatus; retryAfter: number }> {
     const r = w.bundle.card;
-    const handle = r.handle ?? '';
+    // A relay that binds no handles passes none: the record is stored as signed and claims nothing.
+    const handle = w.bindsHandles ? r.handle ?? '' : '';
     const [status, retryAfter] = await this.redis.publishCard(
       CARD_KEY_PREFIX + r.aceId, DIRECTORY_KEY, IDENTITY_KEY_PREFIX + r.aceId, handleKey(handle), HANDLE_OF_KEY_PREFIX + r.aceId,
       `${RATE_KEY_PREFIX}handle-claim:${w.network}`,

@@ -1,6 +1,6 @@
 // 07 § Descriptors and cards: card records, set-once handles, the listed directory and the open-contact send rule.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
+import { createCardRecord, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
 import { HORIZON_BYTES } from '../src/store/identity.js';
 import {
   RELAY_URL, authHeaders, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
@@ -154,6 +154,28 @@ describe('handles', () => {
     expect((await publishCard(relay, a, { handle: 'other', now: now() + 2 })).json().error).toBe('invalid_argument');
     expect((await publishCard(relay, a, { handle: 'mover', now: now() + 2 })).statusCode).toBe(200);
     expect((await get('/v1/handles/mover')).json().card.aceId).toBe(a.aceId);
+  });
+
+  it('path home binds no handle', async () => {
+    // A replica on the same db whose public URL has a path: handles resolve at https://host, so it binds none.
+    const PATH_URL = `${RELAY_URL}/ace`;
+    const pathRelay = await createTestRelay(14, { publicRelayUrl: PATH_URL }, { flush: false });
+    try {
+      const a = await newAgent();
+      const reg = await createRegistrationRequest(a.id, { audience: PATH_URL });
+      expect((await pathRelay.app.inject({ method: 'POST', url: '/v1/register', payload: reg })).statusCode).toBe(200);
+      const bundle = await createCardRecord(a.id, { home: PATH_URL, handle: 'pathy', contact: 'closed', listed: false });
+      expect((await postCard(pathRelay, bundle)).json()).toEqual({ ok: true });
+      expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(bundle);
+      expect((await pathRelay.app.inject({ method: 'GET', url: '/v1/handles/pathy' })).json().error).toBe('unknown_peer');
+      expect(await relay.redis.exists('ace:handle:pathy')).toBe(0);
+      expect(await relay.redis.exists(`ace:handleof:${a.aceId}`)).toBe(0);
+      // Nothing is bound, so a later record may carry another handle or none.
+      const next = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false, now: now() + 1 });
+      expect((await postCard(pathRelay, next)).statusCode).toBe(200);
+    } finally {
+      await pathRelay.close();
+    }
   });
 
   it('card goes dark after rotation until re-signed', async () => {
