@@ -156,17 +156,45 @@ describe('handles', () => {
     expect((await get('/v1/handles/mover')).json().card.aceId).toBe(a.aceId);
   });
 
-  it('handle binding survives signing-key rotation', async () => {
-    const a = await registered(relay);
-    const old = await cardOf(a, { handle: 'rotor' });
-    expect((await postCard(relay, old)).statusCode).toBe(200);
+  it('card goes dark after rotation until re-signed', async () => {
+    const a = await published(relay, { contact: 'open', listed: true, handle: 'rotor' });
+    const from = await newAgent();
+    const inDirectory = async () => {
+      const ids: string[] = [];
+      for (let cursor: string | null = null; ;) {
+        const page = (await get(`/v1/descriptors?limit=100${cursor ? `&cursor=${cursor}` : ''}`)).json();
+        ids.push(...page.agents.map((x: any) => x.descriptor.aceId));
+        if (!(cursor = page.cursor)) return ids.includes(a.aceId);
+      }
+    };
+    expect(await inDirectory()).toBe(true);
     await a.id.delegate();
     expect((await register(relay, a, now() + 1)).json().status).toBe('rotated');
-    expect((await get(`/v1/card/${a.aceId}`)).json()).toEqual(old);
+    // A fresh descriptor under the new KEL: only the stale card stands between a stranger and the recipient now.
+    expect((await publish(relay, a, { now: now() + 1 })).statusCode).toBe(200);
+    expect((await send(relay, await packet(from, a))).json()).toEqual({ error: 'not_permitted', message: 'not permitted' });
+    expect((await get(`/v1/card/${a.aceId}`)).json().error).toBe('unknown_peer');
+    expect((await get('/v1/handles/rotor')).json().error).toBe('unknown_peer');
+    expect(await inDirectory()).toBe(false);
+    // Re-signed under the new KEL (set once still applies): everything is back, same handle.
+    expect((await publishCard(relay, a, { contact: 'open', listed: true, now: now() + 2 })).json().error).toBe('invalid_argument');
+    expect((await publishCard(relay, a, { contact: 'open', listed: true, handle: 'rotor', now: now() + 2 })).statusCode).toBe(200);
+    expect((await get(`/v1/card/${a.aceId}`)).json().kel).toEqual(a.id.getKel());
     expect((await get('/v1/handles/rotor')).json().card.aceId).toBe(a.aceId);
-    expect((await publishCard(relay, a, { now: now() + 2 })).json().error).toBe('invalid_argument');
-    expect((await publishCard(relay, a, { handle: 'rotor', now: now() + 2 })).statusCode).toBe(200);
-    expect((await get('/v1/handles/rotor')).json().kel).toEqual(a.id.getKel());
+    expect(await inDirectory()).toBe(true);
+    expect((await send(relay, await packet(from, a))).json()).toEqual({ ok: true });
+    // Leave the directory to the directory test.
+    expect((await publishCard(relay, a, { handle: 'rotor', now: now() + 3 })).statusCode).toBe(200);
+  });
+
+  it('handle stays bound while card is dark', async () => {
+    const a = await registered(relay), b = await registered(relay);
+    expect((await publishCard(relay, a, { handle: 'dark' })).statusCode).toBe(200);
+    await a.id.delegate();
+    expect((await register(relay, a, now() + 1)).json().status).toBe('rotated');
+    expect((await get('/v1/handles/dark')).json().error).toBe('unknown_peer');
+    expect((await publishCard(relay, b, { handle: 'dark' })).json().error).toBe('handle_taken');
+    expect(await relay.redis.get('ace:handle:dark')).toBe(a.aceId);
   });
 
   it('concurrent claims: exactly one wins', async () => {

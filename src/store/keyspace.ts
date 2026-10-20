@@ -15,8 +15,9 @@
  * |                   |        | cardIssuedAt + cardDigest                                                 |
  * | descriptor:<id>   | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
  * |                   |        | expiresAt/profiles/jb (charged json bytes) until unregister                |
- * | card:<id>         | hash   | newest issuedAt + claims digest (as long as the identity); json/contact/   |
- * |                   |        | listed/jb (charged json bytes) until unregister; no TTL while registered  |
+ * | card:<id>         | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
+ * |                   |        | contact/listed/jb (charged json bytes) until unregister; no TTL while     |
+ * |                   |        | registered; ignored while lastHash is not the registered KEL's            |
  * | descriptors       | zset   | directory: identities whose card record is listed (lex by ACE ID)         |
  * | handle:<handle>   | string | owner ACE ID; permanent, never reassigned (no TTL, survives unregister)   |
  * | handleof:<id>     | string | the identity's handle at this relay; permanent like handle:<handle>       |

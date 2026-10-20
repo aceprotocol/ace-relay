@@ -90,24 +90,25 @@ export class DescriptorStore {
     }
   }
 
-  /** Rows of active identities whose stored descriptor carries their registered KEL and is unexpired, with their card's `listed`. */
+  /** Rows of active identities whose stored descriptor carries their registered KEL and is unexpired, with whether their current card record is listed. */
   private async rows(ids: string[], now: number): Promise<Array<Row | null>> {
     if (ids.length === 0) return [];
     const pipe = this.redis.pipeline();
     for (const id of ids) {
       pipe.hmget(DESCRIPTOR_KEY_PREFIX + id, ...FIELDS);
       pipe.hmget(IDENTITY_KEY_PREFIX + id, 'lastHash', 'retiredAt');
-      pipe.hget(CARD_KEY_PREFIX + id, 'listed');
+      pipe.hmget(CARD_KEY_PREFIX + id, 'listed', 'lastHash');
     }
     const res = (await pipe.exec()) ?? [];
     return ids.map((_, i) => {
       const [e1, d] = res[3 * i] as [Error | null, (string | null)[]];
       const [e2, idn] = res[3 * i + 1] as [Error | null, (string | null)[]];
-      const [e3, listed] = res[3 * i + 2] as [Error | null, string | null];
+      const [e3, card] = res[3 * i + 2] as [Error | null, (string | null)[]];
       if (e1 || e2 || e3) throw e1 ?? e2 ?? e3;
       const [json, lastHash, expiresAt, profiles] = d;
       if (json === null || lastHash === null || idn[1] !== null || idn[0] !== lastHash || !(Number(expiresAt) > now)) return null;
-      return { json, profiles: (profiles ?? '').split(' ').filter(Boolean), listed: listed === '1' };
+      // Listed only by a record published under the current KEL (CardStore).
+      return { json, profiles: (profiles ?? '').split(' ').filter(Boolean), listed: card[0] === '1' && card[1] === lastHash };
     });
   }
 }

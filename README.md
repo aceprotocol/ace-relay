@@ -68,8 +68,10 @@ a descriptor. Handles are **set once, per home**, in the same script as the reco
 A binding (`ace:handle:<h>` → ACE ID, `ace:handleof:<id>` → handle) has no TTL and is never released: not by a new
 record, not by moving `home`, not by unregister. `GET /v1/handles/{handle}` serves the bound identity's stored
 CardBundle only while that record names this relay as `home` and carries the handle, else `unknown_peer`.
-`GET /v1/card/{aceId}` serves the stored record of a registered identity, also one signed under a since-rotated KEL
-(clients verify it; the agent re-signs after a `dlg`). The directory lists identities whose stored record names this
+`GET /v1/card/{aceId}` serves the stored record of a registered identity. A record is bound to the KEL it was
+published under: after any KEL change (`dlg`, `rot`, recovery) it is treated as absent (not served, not listed,
+`closed` for send) until the identity republishes a re-signed record; the handle binding is unaffected. **Agents must
+republish their card record after every KEL change** (the SDK's upkeep does this). The directory lists identities whose stored record names this
 relay as `home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most 100 agents and 8 MiB
 per page, scanning at most 1000 entries; continue until `cursor: null`.
 

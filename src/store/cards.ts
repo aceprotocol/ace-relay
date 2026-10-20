@@ -23,6 +23,8 @@ const CLAIM_WINDOW_SECONDS = 86_400;
  * Handles are set once per home: once `handleof` holds a handle, every record naming this relay as home must carry it;
  * a record naming another home claims and changes nothing here. A new binding (handle and handleof, no TTL) is counted
  * against the client network's daily claims. The json's bytes are charged to the identity's registration network.
+ * The record keeps the registered KEL's lastHash it was published under: after any KEL change (dlg, rot) it is treated
+ * as absent (not served, `closed`, unlisted) until the identity republishes a re-signed record; handle bindings stay.
  */
 const PUBLISH_CARD_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + `
 if not isActive(KEYS[3]) then return {'not_registered', 0} end
@@ -60,8 +62,8 @@ if bind then
   redis.call('SET', KEYS[5], handle)
 end
 if claim and redis.call('INCR', KEYS[6]) == 1 then redis.call('EXPIRE', KEYS[6], ARGV[11]) end
-redis.call('HSET', KEYS[1], 'issuedAt', ARGV[2], 'digest', ARGV[3], 'json', ARGV[4], 'contact', ARGV[8], 'listed', ARGV[9],
-  'jb', #ARGV[4])
+redis.call('HSET', KEYS[1], 'issuedAt', ARGV[2], 'digest', ARGV[3], 'json', ARGV[4], 'lastHash', ARGV[5], 'contact', ARGV[8],
+  'listed', ARGV[9], 'jb', #ARGV[4])
 if ARGV[9] == '1' and atHome then redis.call('ZADD', KEYS[2], 0, ARGV[1]) else redis.call('ZREM', KEYS[2], ARGV[1]) end
 return {'published', 0}
 `;
@@ -101,14 +103,14 @@ export class CardStore {
     return { status, retryAfter: Number(retryAfter) };
   }
 
-  /** The stored CardBundle of an active identity, or null. */
+  /** The stored CardBundle of an active identity, published under its current KEL, or null. */
   async get(aceId: string): Promise<CardBundle | null> {
     if (!isACEId(aceId)) return null;
     const [json, active] = await this.fields(aceId, 'json');
     return json !== null && active !== null ? parse(aceId, json) : null;
   }
 
-  /** The stored record's `contact` of an active identity; no record is `closed` (04 § Card record). */
+  /** The `contact` of the current record (see `get`); no record is `closed` (04 § Card record). */
   async contactOf(aceId: string): Promise<'open' | 'closed'> {
     const [contact, active] = await this.fields(aceId, 'contact');
     return active !== null && contact === 'open' ? 'open' : 'closed';
@@ -125,15 +127,19 @@ export class CardStore {
     return bundle !== null && bundle.card.home === home && bundle.card.handle === handle ? bundle : null;
   }
 
-  /** [card field, '1' when the identity is active else null]. */
+  /**
+   * [card field, '1' when the identity is active and the record was published under its current KEL, else null]. A
+   * record signed under a superseded KEL carries no authorization (contact, listed) until it is re-signed.
+   */
   private async fields(aceId: string, field: 'json' | 'contact'): Promise<[string | null, string | null]> {
     const res = await this.redis.pipeline()
-      .hget(CARD_KEY_PREFIX + aceId, field)
-      .hmget(IDENTITY_KEY_PREFIX + aceId, 'signingPublicKey', 'retiredAt')
+      .hmget(CARD_KEY_PREFIX + aceId, field, 'lastHash')
+      .hmget(IDENTITY_KEY_PREFIX + aceId, 'signingPublicKey', 'retiredAt', 'lastHash')
       .exec();
-    const [[e1, value], [e2, idn]] = res as [[Error | null, string | null], [Error | null, (string | null)[]]];
+    const [[e1, card], [e2, idn]] = res as [[Error | null, (string | null)[]], [Error | null, (string | null)[]]];
     if (e1 || e2) throw e1 ?? e2;
-    return [value, idn[0] !== null && idn[1] === null ? '1' : null];
+    const current = idn[0] !== null && idn[1] === null && card[1] !== null && card[1] === idn[2];
+    return [card[0], current ? '1' : null];
   }
 }
 
