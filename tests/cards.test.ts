@@ -156,23 +156,22 @@ describe('handles', () => {
     expect((await get('/v1/handles/mover')).json().card.aceId).toBe(a.aceId);
   });
 
-  it('path home binds no handle', async () => {
-    // A replica on the same db whose public URL has a path: handles resolve at https://host, so it binds none.
+  it('path home carries no handle', async () => {
+    // A replica on the same db whose public URL has a path: handles resolve at https://host, so a record naming it carries none.
     const PATH_URL = `${RELAY_URL}/ace`;
     const pathRelay = await createTestRelay(14, { publicRelayUrl: PATH_URL }, { flush: false });
     try {
       const a = await newAgent();
       const reg = await createRegistrationRequest(a.id, { audience: PATH_URL });
       expect((await pathRelay.app.inject({ method: 'POST', url: '/v1/register', payload: reg })).statusCode).toBe(200);
-      const bundle = await createCardRecord(a.id, { home: PATH_URL, handle: 'pathy', contact: 'closed', listed: false });
+      const bundle = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false });
+      // Refused at the shape step, before the (now stale) signature is checked.
+      const withHandle = { ...bundle, card: { ...bundle.card, handle: 'pathy' } };
+      expect((await postCard(pathRelay, withHandle)).json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringContaining('path') });
+      expect(await relay.redis.exists('ace:handle:pathy')).toBe(0);
       expect((await postCard(pathRelay, bundle)).json()).toEqual({ ok: true });
       expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(bundle);
-      expect((await pathRelay.app.inject({ method: 'GET', url: '/v1/handles/pathy' })).json().error).toBe('unknown_peer');
-      expect(await relay.redis.exists('ace:handle:pathy')).toBe(0);
       expect(await relay.redis.exists(`ace:handleof:${a.aceId}`)).toBe(0);
-      // Nothing is bound, so a later record may carry another handle or none.
-      const next = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false, now: now() + 1 });
-      expect((await postCard(pathRelay, next)).statusCode).toBe(200);
     } finally {
       await pathRelay.close();
     }
@@ -180,7 +179,7 @@ describe('handles', () => {
 
   it('path relay ignores a binding from a root relay in the same db', async () => {
     // The identity claimed `rooty` at the root relay; a path replica on the same db binds no handle, so that binding
-    // is no constraint there: a record naming it as home with no handle (or another one) is accepted and binds nothing.
+    // is no constraint there: a record naming it as home, which carries no handle, is accepted and binds nothing.
     const PATH_URL = `${RELAY_URL}/ace`;
     const pathRelay = await createTestRelay(14, { publicRelayUrl: PATH_URL }, { flush: false });
     try {
@@ -188,11 +187,8 @@ describe('handles', () => {
       expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
       const bare = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false, now: now() + 1 });
       expect((await postCard(pathRelay, bare)).json()).toEqual({ ok: true });
-      const other = await createCardRecord(a.id, { home: PATH_URL, handle: 'other', contact: 'closed', listed: false, now: now() + 2 });
-      expect((await postCard(pathRelay, other)).json()).toEqual({ ok: true });
-      expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(other);
+      expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(bare);
       expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
-      expect(await relay.redis.exists('ace:handle:other')).toBe(0);
     } finally {
       await pathRelay.close();
     }
