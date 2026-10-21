@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { RelayClient, createDescriptor, type JSONObject, type PublishedAgent } from '@ace-protocol/sdk';
+import {
+  RelayClient, SoftwareIdentity, SoftwareKey, createDescriptor, encodePayload, fromBase64, signingMessage, toBase64, verifyKel,
+  type JSONObject, type KelEvent, type PublishedAgent,
+} from '@ace-protocol/sdk';
 import {
   RELAY_URL, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register, registered, send, type TestRelay,
 } from './helpers.js';
@@ -53,6 +56,53 @@ describe('POST /v1/descriptor', () => {
     expect(served.kel).toEqual(a.id.getKel());
     // Under one KEL issuedAt still only moves forward.
     expect((await publish(relay, a, { now: t - 1 })).json().error).toBe('stale_descriptor');
+  });
+
+  // In place of an absent stored descriptor the horizon is the current signing delegation's dlg ts.
+  it('a fork recovery that re-delegates the same key at the same seq cannot replay a descriptor of the superseded branch', async () => {
+    const a = await registered(relay); // icp (0), dlg (1)
+    const copy = a.id.exportPrivateKey(); // a copy of the log holding the committed next root
+    const t0 = now();
+    await a.id.delegate({ now: t0 }); // dlg (2) of key K
+    expect((await register(relay, a, t0 + 1)).json().status).toBe('rotated');
+    const old = await descriptorOf(a, { now: t0 });
+    expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: old })).statusCode).toBe(200);
+    // Recovery (01 rule 6): rot (1), then a dlg (2) re-delegating K.
+    const nextRoot = new SoftwareKey(fromBase64(copy.nextRootSeed!));
+    const ts = t0 + 5;
+    const kel = (await SoftwareIdentity.recover(copy.kel, nextRoot, { now: ts })).getKel().slice(0, 2);
+    const signingSeed = a.id.exportPrivateKey().signingSeed;
+    const k = new SoftwareKey(fromBase64(signingSeed)).publicKey();
+    const prev = verifyKel(kel, ts).lastHash;
+    const eb = encodePayload('dlg', '2', String(ts), prev, 'ml-dsa-65', k, '');
+    const dlg: KelEvent = {
+      t: 'dlg', seq: 2, ts, prev, key: { scheme: 'ml-dsa-65', publicKey: toBase64(k) },
+      sig: { scheme: 'ml-dsa-65', value: toBase64(await nextRoot.sign(signingMessage(a.aceId, ts, null, eb), 'kel')) },
+    };
+    const recovered = { ...a, id: SoftwareIdentity.fromExport({ rootSeed: copy.nextRootSeed, signingSeed, kel: [...kel, dlg] }, ts) };
+    expect((await register(relay, recovered, ts)).json().status).toBe('rotated');
+    // The superseded branch's descriptor verifies under the recovered KEL (same seq, same key) but predates its dlg.
+    const replay = { kel: recovered.id.getKel(), descriptor: old.descriptor };
+    expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: replay })).json().error).toBe('stale_descriptor');
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
+    expect((await publish(relay, recovered, { now: ts })).json()).toEqual({ ok: true });
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().descriptor.issuedAt).toBe(ts);
+  });
+
+  it('after a fork recovery the owner\'s descriptor replaces one a stolen key dated ahead, from the new dlg\'s ts on', async () => {
+    const a = await registered(relay);
+    const copy = a.id.exportPrivateKey();
+    const t0 = now();
+    // A holder of the stolen signing key dates a descriptor as far ahead as verification allows.
+    expect((await publish(relay, a, { now: t0 + 250 })).statusCode).toBe(200);
+    const ts = t0 + 2;
+    const owner = { ...a, id: await SoftwareIdentity.recover(copy.kel, new SoftwareKey(fromBase64(copy.nextRootSeed!)), { now: ts }) };
+    expect((await register(relay, owner, ts)).json().status).toBe('rotated');
+    expect((await publish(relay, owner, { now: ts - 1 })).json().error).toBe('stale_descriptor');
+    expect((await publish(relay, owner, { now: ts })).json()).toEqual({ ok: true });
+    const served = (await get(`/v1/descriptor/${a.aceId}`)).json();
+    expect(served.descriptor.issuedAt).toBe(ts);
+    expect(served.kel).toEqual(owner.id.getKel());
   });
 });
 

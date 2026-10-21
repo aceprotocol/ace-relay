@@ -8,11 +8,13 @@ export type PublishStatus = 'published' | 'not_registered' | 'kel_conflict' | 's
 
 /**
  * KEYS: descriptor hash, identity hash. ARGV: aceId, issuedAt, claims digest, json, lastHash, expiresAt, profile ids
- * (space separated), then the ByteBudget. The json's bytes (jb) are charged to the network the identity registered from
+ * (space separated), then the ByteBudget, then the ts of the registered KEL's current signing `dlg`. The json's bytes (jb) are charged to the network the identity registered from
  * (07 § Descriptors and cards); a larger document is refused while the store is at the relay-wide high-water mark
  * (`relay_busy`). The directory entry follows the card record (CardStore), not the descriptor. `issuedAt` must be newer than
  * the stored descriptor's (or equal with the same digest) only while that one carries the registered KEL (07 § Descriptors
- * and cards: a stored descriptor under another KEL is absent).
+ * and cards: a stored descriptor under another KEL is absent). In its place `issuedAt` must be at or after the current
+ * signing delegation's ts: a fork recovery (01 rule 6) whose new `dlg` reuses a key at the same seq would otherwise
+ * verify a descriptor signed under the superseded branch, replayable by anyone holding its bytes.
  */
 const PUBLISH_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + `
 if not isActive(KEYS[2]) then return 'not_registered' end
@@ -20,10 +22,16 @@ if redis.call('HGET', KEYS[2], 'lastHash') ~= ARGV[5] then return 'kel_conflict'
 -- A descriptor stored under a superseded KEL is absent, so it cannot hold back the owner's descriptor under the new KEL
 -- (a stolen signing key can date one up to TIMESTAMP_WINDOW_SECONDS ahead). Without a stored lastHash (only the
 -- issuedAt and digest kept across unregister) the horizon still binds.
+-- In its place the horizon is the current signing delegation: a descriptor signed before its dlg (e.g. under the
+-- superseded branch of a fork recovery that re-delegated the same key at the same seq) is stale.
 local stored = redis.call('HGET', KEYS[1], 'lastHash')
-local at = -1
-if not stored or stored == ARGV[5] then at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1') end
 local issuedAt = tonumber(ARGV[2])
+local at = -1
+if not stored or stored == ARGV[5] then
+  at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1')
+elseif issuedAt < tonumber(ARGV[13]) then
+  return 'stale_descriptor'
+end
 if at > issuedAt then return 'stale_descriptor' end
 if at == issuedAt and redis.call('HGET', KEYS[1], 'digest') ~= ARGV[3] then return 'stale_descriptor' end
 local rn = redis.call('HGET', KEYS[2], 'regnet')
@@ -54,12 +62,13 @@ export class DescriptorStore {
     this.redis.defineCommand('publishDescriptor', { numberOfKeys: 2, lua: PUBLISH_SCRIPT });
   }
 
-  publish(agent: PublishedAgent, lastHash: string, digest: string): Promise<PublishStatus> {
+  /** `delegatedAt`: the ts of the `dlg` of the verified KEL's current signing delegation (the registered KEL's, once lastHash matches). */
+  publish(agent: PublishedAgent, lastHash: string, digest: string, delegatedAt: number): Promise<PublishStatus> {
     const d = agent.descriptor;
     return this.redis.publishDescriptor(
       DESCRIPTOR_KEY_PREFIX + d.aceId, IDENTITY_KEY_PREFIX + d.aceId,
       d.aceId, d.issuedAt, digest, JSON.stringify(agent), lastHash, d.expiresAt, d.profiles.map((p) => p.id).join(' '),
-      ...budgetArgs(this.budget),
+      ...budgetArgs(this.budget), delegatedAt,
     );
   }
 
