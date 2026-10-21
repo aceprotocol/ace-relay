@@ -106,9 +106,11 @@ describe('A10 storage bounds', () => {
     await relay.redis.del(`ace:identity:${a.aceId}`, `ace:descriptor:${a.aceId}`, `ace:card:${a.aceId}`);
     expect((await register(relay, a, t + 3)).json().error).toBe('identity_conflict');
     expect((await register(relay, a, t + 4)).json()).toEqual({ ok: true, status: 'registered' });
-    expect((await publish(relay, a, { now: t - 60 })).json().error).toBe('stale_descriptor');
+    // Signing dates a document no earlier than the log's last event, so these may land on the horizon's issuedAt: they
+    // differ in claims (ttl, contact) and are stale either way.
+    expect((await publish(relay, a, { now: t - 60, ttl: 3600 })).json().error).toBe('stale_descriptor');
     expect((await publish(relay, a, { now: t + 4 })).statusCode).toBe(200);
-    expect((await publishCard(relay, a, { handle: 'retiree', now: t - 60 })).json().error).toBe('stale_descriptor');
+    expect((await publishCard(relay, a, { handle: 'retiree', contact: 'closed', now: t - 60 })).json().error).toBe('stale_descriptor');
     // The handle binding outlived it all.
     expect((await publishCard(relay, a, { now: t + 4 })).json().error).toBe('invalid_argument');
     expect((await publishCard(relay, a, { handle: 'retiree', now: t + 4 })).statusCode).toBe(200);

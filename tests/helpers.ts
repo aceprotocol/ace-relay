@@ -13,8 +13,8 @@
 import Redis from 'ioredis';
 import { vi } from 'vitest';
 import {
-  MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, createAuthHeaders, createCardRecord, createDescriptor, createPacket,
-  createPermit, createRegistrationRequest, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
+  MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, canonicalStateBytes, createAuthHeaders, createCardRecord, createDescriptor,
+  createPacket, createPermit, createRegistrationRequest, signingMessage, toBase64, verifyKel, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
   type PrekeyVault, type PublishedAgent, type RelayAuthRequest,
 } from '@ace-protocol/sdk';
 import { buildApp, type RelayApp } from '../src/app.js';
@@ -24,6 +24,8 @@ export const REDIS_ORIGIN = process.env.ACE_TEST_REDIS_ORIGIN ?? 'redis://localh
 export const CAPACITY_REDIS_ORIGIN = process.env.ACE_TEST_CAPACITY_REDIS_ORIGIN ?? 'redis://localhost:16380';
 export const REDIS_URL = (db: number, origin = REDIS_ORIGIN) => `${origin}/${db}`;
 export const RELAY_URL = 'https://relay.test';
+/** Not canonical relay URLs under the ACE HTTPS host grammar (02 § Relay URL): IP literal, empty label, label edge '-', trailing '.'. */
+export const BAD_RELAY_URLS = ['https://[::1]', 'https://a..b', 'https://-a.example', 'https://a-.example', 'https://example.com.'];
 
 /** Config overrides; trusted registration networks as CIDR strings. */
 export type TestOverrides = Partial<Omit<RelayConfig, 'trustedRegistrationNetworks'>> & { trustedRegistrationNetworks?: string[] };
@@ -114,6 +116,17 @@ export async function descriptorOf(agent: Agent, o: { relays?: string[]; now?: n
   return createDescriptor(agent.id, {
     relays: o.relays ?? [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: text.descriptors(), now: o.now, ttl: o.ttl,
   });
+}
+
+/**
+ * `doc` (a descriptor or card record) with its claims re-signed by `agent`'s current signing delegation under `action`
+ * ('agent-descriptor' | 'card-record'), skipping the SDK's create-time checks: for documents the SDK would refuse to make.
+ */
+export async function resign<T extends { issuedAt: number; signature?: unknown }>(agent: Agent, action: string, doc: T): Promise<T> {
+  const { signature: _, ...claims } = doc;
+  const seq = verifyKel(agent.id.getKel(), now()).signing!.seq;
+  const value = toBase64(await agent.id.sign(signingMessage(agent.aceId, doc.issuedAt, seq, canonicalStateBytes(claims)), action));
+  return { ...claims, signature: { scheme: 'ml-dsa-65', seq, value } } as unknown as T;
 }
 
 export async function publish(relay: TestRelay, agent: Agent, o: Parameters<typeof descriptorOf>[1] = {}) {

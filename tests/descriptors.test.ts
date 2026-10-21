@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   RelayClient, SoftwareIdentity, SoftwareKey, createDescriptor, encodePayload, fromBase64, signingMessage, toBase64, verifyKel,
-  type JSONObject, type KelEvent, type PublishedAgent,
+  type JSONObject, type KelEvent, type PublishedAgent, type SoftwareIdentityExport,
 } from '@ace-protocol/sdk';
 import {
-  RELAY_URL, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register, registered, send, type TestRelay,
+  BAD_RELAY_URLS, RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register,
+  registered, resign, send, type Agent, type TestRelay,
 } from './helpers.js';
 
 let relay: TestRelay;
@@ -12,6 +13,27 @@ beforeAll(async () => { relay = await createTestRelay(2); });
 afterAll(async () => { await relay.close(); });
 
 const get = (url: string) => relay.app.inject({ method: 'GET', url });
+const post = (payload: unknown) => relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: payload as object });
+/** 07 § Errors: stale_peer_binding is 401. */
+const expectStale = (res: { statusCode: number; json(): any }) => {
+  expect(res.json().error).toBe('stale_peer_binding');
+  expect(res.statusCode).toBe(401);
+};
+
+/** Fork recovery (01 rule 6) from `copy`: rot (1) at `ts`, then a dlg (2) re-delegating `a`'s current signing key at the same seq. */
+async function recoverRedelegating(a: Agent, copy: SoftwareIdentityExport, ts: number): Promise<Agent> {
+  const nextRoot = new SoftwareKey(fromBase64(copy.nextRootSeed!));
+  const kel = (await SoftwareIdentity.recover(copy.kel, nextRoot, { now: ts })).getKel().slice(0, 2);
+  const signingSeed = a.id.exportPrivateKey().signingSeed;
+  const k = new SoftwareKey(fromBase64(signingSeed)).publicKey();
+  const prev = verifyKel(kel, ts).lastHash;
+  const eb = encodePayload('dlg', '2', String(ts), prev, 'ml-dsa-65', k, '');
+  const dlg: KelEvent = {
+    t: 'dlg', seq: 2, ts, prev, key: { scheme: 'ml-dsa-65', publicKey: toBase64(k) },
+    sig: { scheme: 'ml-dsa-65', value: toBase64(await nextRoot.sign(signingMessage(a.aceId, ts, null, eb), 'kel')) },
+  };
+  return { ...a, id: SoftwareIdentity.fromExport({ rootSeed: copy.nextRootSeed, signingSeed, kel: [...kel, dlg] }, ts) };
+}
 
 describe('POST /v1/descriptor', () => {
   it('requires registration, the registered KEL and this relay in relays', async () => {
@@ -26,7 +48,8 @@ describe('POST /v1/descriptor', () => {
 
   it('rejects an invalid document and keeps only newer descriptors', async () => {
     const a = await registered(relay);
-    const t = now() - 10;
+    // All after the log's last event (createDescriptor dates a descriptor no earlier).
+    const t = now() + 20;
     const d = await descriptorOf(a, { now: t });
     const tampered = structuredClone(d);
     tampered.descriptor.relays = [RELAY_URL, 'https://elsewhere.test'];
@@ -49,7 +72,7 @@ describe('POST /v1/descriptor', () => {
     expect((await register(relay, a, now() + 1)).json().status).toBe('rotated');
     expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
     // The owner's descriptor under the new KEL replaces it although older.
-    const t = now();
+    const t = now() + 3;
     expect((await publish(relay, a, { now: t })).json()).toEqual({ ok: true });
     const served = (await get(`/v1/descriptor/${a.aceId}`)).json();
     expect(served.descriptor.issuedAt).toBe(t);
@@ -58,7 +81,8 @@ describe('POST /v1/descriptor', () => {
     expect((await publish(relay, a, { now: t - 1 })).json().error).toBe('stale_descriptor');
   });
 
-  // In place of an absent stored descriptor the horizon is the current signing delegation's dlg ts.
+  // 04 § Verification step 3 (SP12): a descriptor signed before its delegating dlg is stale_peer_binding, whatever the
+  // relay stores. The relay holds no dlg-ts horizon of its own: the SDK's verification refuses these on every path.
   it('a fork recovery that re-delegates the same key at the same seq cannot replay a descriptor of the superseded branch', async () => {
     const a = await registered(relay); // icp (0), dlg (1)
     const copy = a.id.exportPrivateKey(); // a copy of the log holding the committed next root
@@ -66,27 +90,48 @@ describe('POST /v1/descriptor', () => {
     await a.id.delegate({ now: t0 }); // dlg (2) of key K
     expect((await register(relay, a, t0 + 1)).json().status).toBe('rotated');
     const old = await descriptorOf(a, { now: t0 });
-    expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: old })).statusCode).toBe(200);
-    // Recovery (01 rule 6): rot (1), then a dlg (2) re-delegating K.
-    const nextRoot = new SoftwareKey(fromBase64(copy.nextRootSeed!));
+    expect((await post(old)).statusCode).toBe(200);
     const ts = t0 + 5;
-    const kel = (await SoftwareIdentity.recover(copy.kel, nextRoot, { now: ts })).getKel().slice(0, 2);
-    const signingSeed = a.id.exportPrivateKey().signingSeed;
-    const k = new SoftwareKey(fromBase64(signingSeed)).publicKey();
-    const prev = verifyKel(kel, ts).lastHash;
-    const eb = encodePayload('dlg', '2', String(ts), prev, 'ml-dsa-65', k, '');
-    const dlg: KelEvent = {
-      t: 'dlg', seq: 2, ts, prev, key: { scheme: 'ml-dsa-65', publicKey: toBase64(k) },
-      sig: { scheme: 'ml-dsa-65', value: toBase64(await nextRoot.sign(signingMessage(a.aceId, ts, null, eb), 'kel')) },
-    };
-    const recovered = { ...a, id: SoftwareIdentity.fromExport({ rootSeed: copy.nextRootSeed, signingSeed, kel: [...kel, dlg] }, ts) };
+    const recovered = await recoverRedelegating(a, copy, ts);
     expect((await register(relay, recovered, ts)).json().status).toBe('rotated');
-    // The superseded branch's descriptor verifies under the recovered KEL (same seq, same key) but predates its dlg.
-    const replay = { kel: recovered.id.getKel(), descriptor: old.descriptor };
-    expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: replay })).json().error).toBe('stale_descriptor');
+    // The superseded branch's descriptor names the recovered KEL's seq and key but predates its dlg.
+    expectStale(await post({ kel: recovered.id.getKel(), descriptor: old.descriptor }));
     expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
     expect((await publish(relay, recovered, { now: ts })).json()).toEqual({ ok: true });
     expect((await get(`/v1/descriptor/${a.aceId}`)).json().descriptor.issuedAt).toBe(ts);
+  });
+
+  it('the replay is refused with no stored descriptor here', async () => {
+    const a = await registered(relay);
+    const copy = a.id.exportPrivateKey();
+    const t0 = now();
+    await a.id.delegate({ now: t0 }); // never shown to this relay
+    const old = await descriptorOf(a, { now: t0 });
+    const ts = t0 + 5;
+    const recovered = await recoverRedelegating(a, copy, ts);
+    expect((await register(relay, recovered, ts)).statusCode).toBe(200);
+    expect(await relay.redis.exists(`ace:descriptor:${a.aceId}`)).toBe(0);
+    expectStale(await post({ kel: recovered.id.getKel(), descriptor: old.descriptor }));
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
+  });
+
+  it('the replay is refused after unregister and re-registration under the recovered KEL', async () => {
+    const a = await registered(relay);
+    const copy = a.id.exportPrivateKey();
+    const t0 = now();
+    await a.id.delegate({ now: t0 });
+    expect((await register(relay, a, t0 + 1)).json().status).toBe('rotated');
+    const old = await descriptorOf(a, { now: t0 });
+    expect((await post(old)).statusCode).toBe(200);
+    const unregister = await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, t0 + 2) });
+    expect(unregister.statusCode).toBe(200);
+    const ts = t0 + 5;
+    const recovered = await recoverRedelegating(a, copy, ts);
+    expect((await register(relay, recovered, ts)).statusCode).toBe(200);
+    // The issuedAt and digest kept across unregister would admit the identical bytes; verification does not.
+    expectStale(await post({ kel: recovered.id.getKel(), descriptor: old.descriptor }));
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
+    expect((await publish(relay, recovered, { now: ts })).json()).toEqual({ ok: true });
   });
 
   it('after a fork recovery the owner\'s descriptor replaces one a stolen key dated ahead, from the new dlg\'s ts on', async () => {
@@ -98,11 +143,22 @@ describe('POST /v1/descriptor', () => {
     const ts = t0 + 2;
     const owner = { ...a, id: await SoftwareIdentity.recover(copy.kel, new SoftwareKey(fromBase64(copy.nextRootSeed!)), { now: ts }) };
     expect((await register(relay, owner, ts)).json().status).toBe('rotated');
-    expect((await publish(relay, owner, { now: ts - 1 })).json().error).toBe('stale_descriptor');
+    // Signed before the new dlg: refused by verification, not by the stored (absent) descriptor.
+    const early = await descriptorOf(owner, { now: ts });
+    expectStale(await post({ kel: early.kel, descriptor: await resign(owner, 'agent-descriptor', { ...early.descriptor, issuedAt: ts - 1 }) }));
     expect((await publish(relay, owner, { now: ts })).json()).toEqual({ ok: true });
     const served = (await get(`/v1/descriptor/${a.aceId}`)).json();
     expect(served.descriptor.issuedAt).toBe(ts);
     expect(served.kel).toEqual(owner.id.getKel());
+  });
+
+  // 02 § Relay URL: the ACE HTTPS host grammar (C1).
+  it.each(BAD_RELAY_URLS)('refuses a descriptor routing to %s', async (bad) => {
+    const a = await registered(relay);
+    const d = await descriptorOf(a);
+    const res = await post({ kel: d.kel, descriptor: await resign(a, 'agent-descriptor', { ...d.descriptor, relays: [RELAY_URL, bad] }) });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error).toBe('invalid_authorization');
   });
 });
 

@@ -48,9 +48,8 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     const { agent, state } = sdk(() => verifyPublishedAgent(req.body, clock(), verifyOpts));
     const d = agent.descriptor;
     if (!d.relays.includes(audience)) throw new RelayError('invalid_argument', `descriptor relays must include ${audience}`);
-    // The store checks the registration and its KEL. verifyPublishedAgent requires a live signing delegation.
-    const delegatedAt = state.events[state.signing!.seq].ts as number;
-    const status = await descriptors.publish(agent, state.lastHash, documentDigest(d), delegatedAt);
+    // The store checks the registration and its KEL.
+    const status = await descriptors.publish(agent, state.lastHash, documentDigest(d));
     if (status === 'rate_limited' || status === 'relay_busy') throw storageRefusal(status);
     if (status !== 'published') throw new RelayError(status);
     return { ok: true };

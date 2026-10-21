@@ -26,12 +26,18 @@ const CLAIM_WINDOW_SECONDS = 86_400;
  * path) neither checks nor writes a binding: a record naming it as home carries no handle (04 § Card record). A new binding (handle and handleof, no TTL) is counted
  * against the client network's daily claims. The json's bytes are charged to the identity's registration network.
  * The record keeps the registered KEL's lastHash it was published under: after any KEL change (dlg, rot) it is treated
- * as absent (not served, `closed`, unlisted) until the identity republishes a re-signed record; handle bindings stay.
+ * as absent (not served, `closed`, unlisted, and its `issuedAt` bounds no new record) until the identity republishes a
+ * re-signed record; handle bindings stay.
  */
 const PUBLISH_CARD_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + `
 if not isActive(KEYS[3]) then return {'not_registered', 0} end
 if redis.call('HGET', KEYS[3], 'lastHash') ~= ARGV[5] then return {'kel_conflict', 0} end
-local at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1')
+-- A record stored under a superseded KEL is absent, so its issuedAt (a stolen signing key can date one up to
+-- TIMESTAMP_WINDOW_SECONDS ahead) cannot hold back the owner's record under the new KEL. Without a stored lastHash the
+-- horizon still binds.
+local stored = redis.call('HGET', KEYS[1], 'lastHash')
+local at = -1
+if not stored or stored == ARGV[5] then at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1') end
 local issuedAt = tonumber(ARGV[2])
 if at > issuedAt then return {'stale_descriptor', 0} end
 if at == issuedAt and redis.call('HGET', KEYS[1], 'digest') ~= ARGV[3] then return {'stale_descriptor', 0} end

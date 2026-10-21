@@ -3,8 +3,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createCardRecord, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
 import { HORIZON_BYTES } from '../src/store/identity.js';
 import {
-  RELAY_URL, authHeaders, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
-  registered, send, type Agent, type TestRelay,
+  BAD_RELAY_URLS, RELAY_URL, authHeaders, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
+  registered, resign, send, type Agent, type TestRelay,
 } from './helpers.js';
 
 // Several tests generate many ML-DSA identities.
@@ -72,7 +72,8 @@ describe('POST /v1/card', () => {
 describe('ordering', () => {
   it('stale issuedAt is stale_descriptor', async () => {
     const a = await registered(relay);
-    const t = now();
+    // Both after the log's last event (createCardRecord dates a record no earlier).
+    const t = now() + 2;
     expect((await publishCard(relay, a, { now: t })).statusCode).toBe(200);
     expect((await publishCard(relay, a, { now: t - 1 })).json().error).toBe('stale_descriptor');
   });
@@ -90,6 +91,37 @@ describe('ordering', () => {
     expect((await postCard(relay, bundle)).json()).toEqual({ ok: true });
     expect((await postCard(relay, bundle)).json()).toEqual({ ok: true });
     expect((await get(`/v1/card/${a.aceId}`)).json()).toEqual(bundle);
+  });
+});
+
+describe('superseded KEL', () => {
+  // 07 § Descriptors and cards: a stored record whose kel is not the registered KEL is absent, also on publish.
+  it('a record a stolen key dated ahead under the old KEL does not hold back the owner\'s record under the new KEL', async () => {
+    const a = await registered(relay);
+    const ahead = now() + 250;
+    expect((await publishCard(relay, a, { now: ahead, contact: 'open' })).statusCode).toBe(200);
+    await a.id.delegate();
+    expect((await register(relay, a, now() + 1)).json().status).toBe('rotated');
+    expect((await get(`/v1/card/${a.aceId}`)).json().error).toBe('unknown_peer');
+    const t = now() + 3;
+    expect((await publishCard(relay, a, { now: t })).json()).toEqual({ ok: true });
+    const served = (await get(`/v1/card/${a.aceId}`)).json();
+    expect(served.card.issuedAt).toBe(t);
+    expect(served.kel).toEqual(a.id.getKel());
+    // Under one KEL issuedAt still only moves forward.
+    expect((await publishCard(relay, a, { now: t - 1, contact: 'open' })).json().error).toBe('stale_descriptor');
+  });
+});
+
+describe('home URL', () => {
+  // 02 § Relay URL: the ACE HTTPS host grammar (C1).
+  it.each(BAD_RELAY_URLS)('refuses a record whose home is %s', async (bad) => {
+    const a = await registered(relay);
+    const b = await cardOf(a);
+    const res = await postCard(relay, { kel: b.kel, card: await resign(a, 'card-record', { ...b.card, home: bad }) });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error).toBe('invalid_authorization');
+    expect((await get(`/v1/card/${a.aceId}`)).json().error).toBe('unknown_peer');
   });
 });
 
