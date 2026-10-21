@@ -123,16 +123,13 @@ redis.call('HSET', KEYS[1], 'kel', ARGV[1], 'seq', ARGV[2], 'lastHash', ARGV[3],
   'registeredAt', ARGV[5], 'requestDigest', ARGV[6], 'regnet', rn, 'kb', kb)
 redis.call('HDEL', KEYS[1], 'retiredAt')
 redis.call('PERSIST', KEYS[1])
-redis.call('PERSIST', KEYS[2])
-redis.call('PERSIST', KEYS[4])
--- The descriptor and card record horizons outlive their expired records.
-local issuedAt = redis.call('HGET', KEYS[3], 'issuedAt')
-if issuedAt and redis.call('HEXISTS', KEYS[2], 'issuedAt') == 0 then
-  redis.call('HSET', KEYS[2], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[3], 'digest'))
-end
-local cardIssuedAt = redis.call('HGET', KEYS[3], 'cardIssuedAt')
-if cardIssuedAt and redis.call('HEXISTS', KEYS[4], 'issuedAt') == 0 then
-  redis.call('HSET', KEYS[4], 'issuedAt', cardIssuedAt, 'digest', redis.call('HGET', KEYS[3], 'cardDigest'))
+-- The descriptor and card record horizons (their issuedAt and digest fields in the horizon hash) outlive their expired records.
+for _, doc in ipairs({{KEYS[2], 'issuedAt', 'digest'}, {KEYS[4], 'cardIssuedAt', 'cardDigest'}}) do
+  redis.call('PERSIST', doc[1])
+  local issuedAt = redis.call('HGET', KEYS[3], doc[2])
+  if issuedAt and redis.call('HEXISTS', doc[1], 'issuedAt') == 0 then
+    redis.call('HSET', doc[1], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[3], doc[3]))
+  end
 end
 return status
 `;
@@ -167,12 +164,10 @@ if redis.call('EXISTS', KEYS[9]) == 0 then charge(rn, ${HORIZON_BYTES}) end
 redis.call('DEL', KEYS[9])
 redis.call('HSET', KEYS[9], 'retiredAt', ARGV[1], 'epochSeq', ARGV[10], 'epochStartHash', ARGV[11], 'lastSeq', ARGV[12],
   'lastHash', ARGV[3])
-local issuedAt = redis.call('HGET', KEYS[2], 'issuedAt')
-if issuedAt then redis.call('HSET', KEYS[9], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[2], 'digest')) end
-local cardIssuedAt = redis.call('HGET', KEYS[10], 'issuedAt')
-if cardIssuedAt then redis.call('HSET', KEYS[9], 'cardIssuedAt', cardIssuedAt, 'cardDigest', redis.call('HGET', KEYS[10], 'digest')) end
-for _, key in ipairs({KEYS[2], KEYS[10]}) do
-  if redis.call('EXISTS', key) == 1 then redis.call('EXPIRE', key, ${OFFLINE_WINDOW_SECONDS}) end
+for _, doc in ipairs({{KEYS[2], 'issuedAt', 'digest'}, {KEYS[10], 'cardIssuedAt', 'cardDigest'}}) do
+  local issuedAt = redis.call('HGET', doc[1], 'issuedAt')
+  if issuedAt then redis.call('HSET', KEYS[9], doc[2], issuedAt, doc[3], redis.call('HGET', doc[1], 'digest')) end
+  if redis.call('EXISTS', doc[1]) == 1 then redis.call('EXPIRE', doc[1], ${OFFLINE_WINDOW_SECONDS}) end
 end
 return 'removed'
 `;

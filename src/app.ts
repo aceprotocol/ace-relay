@@ -71,7 +71,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<RelayApp> {
   const messageStore = new MessageStore(redis, config);
   const identityStore = new IdentityStore(redis, messageStore.budget);
   const descriptorStore = new DescriptorStore(redis, messageStore.budget);
-  const cardStore = new CardStore(redis, messageStore.budget, config.handleClaimsPerNetworkPerDay);
+  const cardStore = new CardStore(redis, messageStore.budget, config.handleClaimsPerNetworkPerDay, config.publicRelayUrl);
   const blockStore = new BlockStore(redis, messageStore.budget);
   const rateLimiter = new RateLimiter(redis, config.storageHighWaterBytes);
   const replayStore = new ReplayStore(redis);

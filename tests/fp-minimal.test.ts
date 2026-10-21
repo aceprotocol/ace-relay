@@ -4,7 +4,7 @@ import {
   MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, SoftwareIdentity, SoftwareKey, createPermit, createRegistrationRequest, fromBase64,
 } from '@ace-protocol/sdk';
 import {
-  RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, published, register, send,
+  RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, published, register, send, unregister,
   type Agent, type TestRelay,
 } from './helpers.js';
 import { REGNET_STORED_KEY_PREFIX } from '../src/store/keyspace.js';
@@ -117,8 +117,7 @@ describe('A10 storage bounds', () => {
   });
 
   const expire = (aceId: string) => relay.redis.del(`ace:identity:${aceId}`, `ace:descriptor:${aceId}`);
-  const unregister = async (a: Agent, at: number) =>
-    expect((await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, at) })).statusCode).toBe(200);
+  const unregistered = async (a: Agent, at: number) => expect((await unregister(relay, a, at)).statusCode).toBe(200);
 
   it('rollback after expiry refused', async () => {
     // A superseded delegation key (same root epoch) and a superseded root (an older epoch).
@@ -130,7 +129,7 @@ describe('A10 storage bounds', () => {
     const oldRoot = SoftwareIdentity.fromExport(a.id.exportPrivateKey());
     await a.id.rotate();
     expect((await register(relay, a, t + 1)).json()).toEqual({ ok: true, status: 'rotated' });
-    await unregister(a, t + 2);
+    await unregistered(a, t + 2);
     await expire(a.aceId);
     const old = (id: SoftwareIdentity) => ({ ...a, id });
     expect((await register(relay, old(oldRoot), t + 3)).json().error).toBe('kel_conflict');
@@ -141,7 +140,7 @@ describe('A10 storage bounds', () => {
     const bOld = SoftwareIdentity.fromExport(b.id.exportPrivateKey());
     await b.id.delegate();
     expect((await register(relay, b, t + 1)).json()).toEqual({ ok: true, status: 'rotated' });
-    await unregister(b, t + 2);
+    await unregistered(b, t + 2);
     await expire(b.aceId);
     expect((await register(relay, { ...b, id: bOld }, t + 3)).json().error).toBe('stale_seq');
     await bOld.delegate();
@@ -154,7 +153,7 @@ describe('A10 storage bounds', () => {
     const fork = SoftwareIdentity.fromExport(a.id.exportPrivateKey());
     await a.id.delegate();
     expect((await register(relay, a, t)).statusCode).toBe(200);
-    await unregister(a, t + 1);
+    await unregistered(a, t + 1);
     await expire(a.aceId);
     // Same epoch start, then delegations the retired log never had: longer than it, no rot.
     await fork.delegate();
@@ -167,13 +166,13 @@ describe('A10 storage bounds', () => {
     const a = await newAgent();
     const t = now();
     expect((await register(relay, a, t)).statusCode).toBe(200);
-    await unregister(a, t + 1);
+    await unregistered(a, t + 1);
     await expire(a.aceId);
     const backup = a.id.exportPrivateKey();
     await a.id.delegate();
     expect((await register(relay, a, t + 2)).json()).toEqual({ ok: true, status: 'registered' });
     // The holder of the committed next root recovers from a copy of the log taken before that delegation.
-    await unregister(a, t + 3);
+    await unregistered(a, t + 3);
     await expire(a.aceId);
     const nextRoot = new SoftwareKey(fromBase64(backup.nextRootSeed!));
     const recovered = await SoftwareIdentity.recover(a.id.getKel(), nextRoot);

@@ -40,8 +40,6 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
   const { descriptors, cards, blocks, rateLimiter, config, clock } = deps;
   const audience = config.publicRelayUrl;
   const verifyOpts = { allowLoopbackRelays: audience.startsWith('http://') };
-  // Handles are written @name@host and resolve at https://host, so a relay whose public URL has a path binds none (04 § Card record).
-  const bindsHandles = new URL(audience).pathname === '/';
 
   app.post('/v1/descriptor', { bodyLimit: MAX_PUBLISHED_AGENT_BYTES }, async (req: FastifyRequest) => {
     await enforceRegistrationRate(deps, req, 'descriptor');
@@ -68,8 +66,7 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     await enforceRegistrationRate(deps, req, 'card');
     const { record, kelState, bundle } = sdk(() => verifyCardBundle(req.body, clock(), verifyOpts));
     const { status, retryAfter } = await cards.publish({
-      bundle, lastHash: kelState.lastHash, digest: documentDigest(record), atHome: record.home === audience, bindsHandles,
-      network: networkOf(req),
+      bundle, lastHash: kelState.lastHash, digest: documentDigest(record), network: networkOf(req),
     });
     switch (status) {
       case 'published':
@@ -88,14 +85,14 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
 
   app.get('/v1/card/:aceId', async (req: FastifyRequest) => {
     const { aceId } = req.params as { aceId: string };
-    const bundle = isACEId(aceId) ? await cards.get(aceId) : null;
+    const bundle = await cards.get(aceId);
     if (!bundle) throw new RelayError('unknown_peer');
     return bundle;
   });
 
   app.get('/v1/handles/:handle', async (req: FastifyRequest) => {
     const { handle } = req.params as { handle: string };
-    const bundle = bindsHandles && isHandle(handle) ? await cards.resolveHandle(handle, audience) : null;
+    const bundle = isHandle(handle) ? await cards.resolveHandle(handle) : null;
     if (!bundle) throw new RelayError('unknown_peer');
     return bundle;
   });

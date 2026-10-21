@@ -62,6 +62,15 @@ export class StorageError extends Error {
   }
 }
 
+/** A stored json document (`what`: e.g. `descriptor of <aceId>`); unparseable is a StorageError. */
+export function parseStored<T>(json: string, what: string): T {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    throw new StorageError(`corrupt ${what}`);
+  }
+}
+
 export function sendError(reply: FastifyReply, err: RelayError): FastifyReply {
   if (err.retryAfterSeconds !== undefined) reply.header('Retry-After', String(err.retryAfterSeconds));
   const body: { error: RelayErrorCode; message?: string } = { error: err.code };

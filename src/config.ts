@@ -3,7 +3,7 @@ import { BlockList, isIP } from 'node:net';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, isCanonicalRelayUrl, normalizeRelayUrl } from '@ace-protocol/sdk';
 
 /** 02 constant (07 § Descriptors and cards): new handle bindings per client network per day. Import it from the SDK once it exports it. */
-export const HANDLE_CLAIMS_PER_NETWORK_PER_DAY = 8;
+const HANDLE_CLAIMS_PER_NETWORK_PER_DAY = 8;
 
 /** Request body limit of the routes without their own (07 sets MAX_PUBLISHED_AGENT_BYTES and MAX_SEND_BODY_BYTES). */
 export const BODY_LIMIT_BYTES = 64 * 1024;
@@ -88,7 +88,6 @@ export interface RelayConfig {
   /** Bound of one wake request (DNS, connect and response). */
   wakeTimeoutMs: number;
 }
-
 
 /** `address/prefix` CIDRs (IPv4 or IPv6), parsed once into matchers. A malformed entry throws. */
 export function parseCidrs(list: readonly string[]): TrustedNetwork[] {

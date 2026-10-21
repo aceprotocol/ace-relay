@@ -65,8 +65,10 @@ export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<
       kind = 'normal';
     } else {
       // 5. The stranger allowance of a recipient whose card record is `contact: open`, with an unexpired descriptor.
-      const [contact, self] = await Promise.all([cards.contactOf(packet.to), descriptors.get(packet.to, now)]);
-      if (contact !== 'open' || self === null) throw notPermitted();
+      const [contact, live] = await Promise.all([
+        cards.contactOf(packet.to, recipient.lastHash), descriptors.isLive(packet.to, recipient.lastHash, now),
+      ]);
+      if (contact !== 'open' || !live) throw notPermitted();
       await enforceRate(rateLimiter, `stranger-ip:${network}`, config.strangerIpRateLimit, 3600, 'network');
       await enforceRate(rateLimiter, `stranger-to:${packet.to}`, config.strangerRecipientRateLimit, 3600, 'identity');
       kind = 'stranger';

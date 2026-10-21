@@ -1,8 +1,8 @@
 import type Redis from 'ioredis';
 import { MAX_PAGE_BYTES, type PublishedAgent } from '@ace-protocol/sdk';
-import { CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, IDENTITY_KEY_PREFIX } from './keyspace.js';
-import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, budgetArgs, type ByteBudget } from './lua.js';
-import { StorageError } from '../errors.js';
+import { ACTIVE_FIELDS, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, IDENTITY_KEY_PREFIX, activeLastHash } from './keyspace.js';
+import { BYTES_LUA, CAPACITY_LUA, DOCUMENT_LUA, IDENTITY_LUA, MAY_GROW, budgetArgs, type ByteBudget } from './lua.js';
+import { parseStored } from '../errors.js';
 
 export type PublishStatus = 'published' | 'not_registered' | 'kel_conflict' | 'stale_descriptor' | 'rate_limited' | 'relay_busy';
 
@@ -16,23 +16,12 @@ export type PublishStatus = 'published' | 'not_registered' | 'kel_conflict' | 's
  * the superseded branch of a fork recovery that re-delegated the same key at the same seq) is refused by verification
  * (`stale_peer_binding`, 04 § Verification step 3), not here.
  */
-const PUBLISH_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + `
+const PUBLISH_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + DOCUMENT_LUA + `
 if not isActive(KEYS[2]) then return 'not_registered' end
 if redis.call('HGET', KEYS[2], 'lastHash') ~= ARGV[5] then return 'kel_conflict' end
--- A descriptor stored under a superseded KEL is absent, so it cannot hold back the owner's descriptor under the new KEL
--- (a stolen signing key can date one up to TIMESTAMP_WINDOW_SECONDS ahead). Without a stored lastHash (only the
--- issuedAt and digest kept across unregister) the horizon still binds.
-local stored = redis.call('HGET', KEYS[1], 'lastHash')
-local at = -1
-if not stored or stored == ARGV[5] then at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1') end
-local issuedAt = tonumber(ARGV[2])
-if at > issuedAt then return 'stale_descriptor' end
-if at == issuedAt and redis.call('HGET', KEYS[1], 'digest') ~= ARGV[3] then return 'stale_descriptor' end
-local rn = redis.call('HGET', KEYS[2], 'regnet')
-local delta = #ARGV[4] - tonumber(redis.call('HGET', KEYS[1], 'jb') or '0')
-if rn and overBudget(rn, delta, tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10]), tonumber(ARGV[11])) then return 'rate_limited' end
-if delta > 0 and atCapacity(tonumber(ARGV[12])) then return 'relay_busy' end
-charge(rn, delta)
+if isStale(KEYS[1], ARGV[5], ARGV[2], ARGV[3]) then return 'stale_descriptor' end
+local refused = chargeDocument(KEYS[1], KEYS[2], ARGV[4], 8)
+if refused then return refused end
 redis.call('HSET', KEYS[1], 'issuedAt', ARGV[2], 'digest', ARGV[3], 'json', ARGV[4], 'lastHash', ARGV[5],
   'expiresAt', ARGV[6], 'profiles', ARGV[7], 'jb', #ARGV[4])
 return 'published'
@@ -68,7 +57,16 @@ export class DescriptorStore {
   /** The stored, unexpired descriptor of an active identity whose KEL it carries. */
   async get(aceId: string, now: number): Promise<PublishedAgent | null> {
     const [row] = await this.rows([aceId], now);
-    return row ? parse(aceId, row.json) : null;
+    return row ? parseStored<PublishedAgent>(row.json, `descriptor of ${aceId}`) : null;
+  }
+
+  /**
+   * Whether the stored descriptor carries `lastHash`, the registered KEL of an identity the caller read as active, and is
+   * unexpired (see `get`), without reading the document.
+   */
+  async isLive(aceId: string, lastHash: string, now: number): Promise<boolean> {
+    const [stored, expiresAt] = await this.redis.hmget(DESCRIPTOR_KEY_PREFIX + aceId, 'lastHash', 'expiresAt');
+    return stored === lastHash && Number(expiresAt) > now;
   }
 
   /** Unexpired descriptors of listed identities ordered by ACE ID after `cursor`, optionally listing `profile`. */
@@ -85,7 +83,7 @@ export class DescriptorStore {
         if (row && row.listed && (!profile || row.profiles.includes(profile))) {
           const size = Buffer.byteLength(row.json) + 1;
           if (agents.length > 0 && bytes + size > MAX_PAGE_BYTES) return { agents, cursor: after ?? null };
-          agents.push(parse(ids[i], row.json));
+          agents.push(parseStored<PublishedAgent>(row.json, `descriptor of ${ids[i]}`));
           bytes += size;
         }
         after = ids[i];
@@ -105,7 +103,7 @@ export class DescriptorStore {
     const pipe = this.redis.pipeline();
     for (const id of ids) {
       pipe.hmget(DESCRIPTOR_KEY_PREFIX + id, ...FIELDS);
-      pipe.hmget(IDENTITY_KEY_PREFIX + id, 'lastHash', 'retiredAt');
+      pipe.hmget(IDENTITY_KEY_PREFIX + id, ...ACTIVE_FIELDS);
       pipe.hmget(CARD_KEY_PREFIX + id, 'listed', 'lastHash');
     }
     const res = (await pipe.exec()) ?? [];
@@ -115,17 +113,10 @@ export class DescriptorStore {
       const [e3, card] = res[3 * i + 2] as [Error | null, (string | null)[]];
       if (e1 || e2 || e3) throw e1 ?? e2 ?? e3;
       const [json, lastHash, expiresAt, profiles] = d;
-      if (json === null || lastHash === null || idn[1] !== null || idn[0] !== lastHash || !(Number(expiresAt) > now)) return null;
+      const current = activeLastHash(idn);
+      if (json === null || current === null || lastHash !== current || !(Number(expiresAt) > now)) return null;
       // Listed only by a record published under the current KEL (CardStore).
-      return { json, profiles: (profiles ?? '').split(' ').filter(Boolean), listed: card[0] === '1' && card[1] === lastHash };
+      return { json, profiles: (profiles ?? '').split(' ').filter(Boolean), listed: card[0] === '1' && card[1] === current };
     });
-  }
-}
-
-function parse(aceId: string, json: string): PublishedAgent {
-  try {
-    return JSON.parse(json) as PublishedAgent;
-  } catch {
-    throw new StorageError(`corrupt descriptor of ${aceId}`);
   }
 }

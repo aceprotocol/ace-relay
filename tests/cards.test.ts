@@ -1,10 +1,10 @@
 // 07 § Descriptors and cards: card records, set-once handles, the listed directory and the open-contact send rule.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createCardRecord, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
+import { createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
 import { HORIZON_BYTES } from '../src/store/identity.js';
 import {
-  BAD_RELAY_URLS, RELAY_URL, authHeaders, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
-  registered, resign, send, type Agent, type TestRelay,
+  BAD_RELAY_URLS, RELAY_URL, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
+  registered, resign, send, unregister, type TestRelay,
 } from './helpers.js';
 
 // Several tests generate many ML-DSA identities.
@@ -15,8 +15,6 @@ beforeAll(async () => { relay = await createTestRelay(14); });
 afterAll(async () => { await relay.close(); });
 
 const get = (url: string) => relay.app.inject({ method: 'GET', url });
-const unregister = async (a: Agent, t = now() + 1) =>
-  relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, t) });
 const OTHER_HOME = 'https://other.test';
 
 describe('POST /v1/card', () => {
@@ -63,7 +61,7 @@ describe('POST /v1/card', () => {
     const nextBytes = Buffer.byteLength(JSON.stringify(next));
     expect((await relay.messageStore.registrationNetworkBytes(net)) - before).toBe(nextBytes);
     const held = await relay.messageStore.registrationNetworkBytes(net);
-    expect((await unregister(a, now() + 2)).statusCode).toBe(200);
+    expect((await unregister(relay, a, now() + 2)).statusCode).toBe(200);
     // The card's bytes are released at once (the KEL's lapse with the packet window; the horizon is charged for good).
     expect(held - (await relay.messageStore.registrationNetworkBytes(net))).toBe(nextBytes - HORIZON_BYTES);
   });
@@ -72,7 +70,7 @@ describe('POST /v1/card', () => {
 describe('ordering', () => {
   it('stale issuedAt is stale_descriptor', async () => {
     const a = await registered(relay);
-    // Both after the log's last event (createCardRecord dates a record no earlier).
+    // Both after the log's last event (cardOf dates a record no earlier).
     const t = now() + 2;
     expect((await publishCard(relay, a, { now: t })).statusCode).toBe(200);
     expect((await publishCard(relay, a, { now: t - 1 })).json().error).toBe('stale_descriptor');
@@ -196,7 +194,7 @@ describe('handles', () => {
       const a = await newAgent();
       const reg = await createRegistrationRequest(a.id, { audience: PATH_URL });
       expect((await pathRelay.app.inject({ method: 'POST', url: '/v1/register', payload: reg })).statusCode).toBe(200);
-      const bundle = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false });
+      const bundle = await cardOf(a, { home: PATH_URL });
       // Refused at the shape step, before the (now stale) signature is checked.
       const withHandle = { ...bundle, card: { ...bundle.card, handle: 'pathy' } };
       expect((await postCard(pathRelay, withHandle)).json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringContaining('path') });
@@ -217,7 +215,7 @@ describe('handles', () => {
     try {
       const a = await published(relay, { contact: 'closed', handle: 'rooty' });
       expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
-      const bare = await createCardRecord(a.id, { home: PATH_URL, contact: 'closed', listed: false, now: now() + 1 });
+      const bare = await cardOf(a, { home: PATH_URL, now: now() + 1 });
       expect((await postCard(pathRelay, bare)).json()).toEqual({ ok: true });
       expect((await pathRelay.app.inject({ method: 'GET', url: `/v1/card/${a.aceId}` })).json()).toEqual(bare);
       expect(await relay.redis.get(`ace:handleof:${a.aceId}`)).toBe('rooty');
@@ -300,7 +298,7 @@ describe('handles', () => {
   it('unregister keeps the handle bound', async () => {
     const a = await registered(relay), b = await registered(relay);
     expect((await publishCard(relay, a, { handle: 'leaver' })).statusCode).toBe(200);
-    expect((await unregister(a)).statusCode).toBe(200);
+    expect((await unregister(relay, a)).statusCode).toBe(200);
     expect((await get('/v1/handles/leaver')).json().error).toBe('unknown_peer');
     expect((await get(`/v1/card/${a.aceId}`)).json().error).toBe('unknown_peer');
     expect(await relay.redis.hget(`ace:card:${a.aceId}`, 'json')).toBeNull();
@@ -321,7 +319,7 @@ describe('handles', () => {
     expect((await postCard(relay, older)).statusCode).toBe(200);
     const newer = await cardOf(a, { now: t + 1, contact: 'open' });
     expect((await postCard(relay, newer)).statusCode).toBe(200);
-    expect((await unregister(a, t + 2)).statusCode).toBe(200);
+    expect((await unregister(relay, a, t + 2)).statusCode).toBe(200);
     expect((await register(relay, a, t + 3)).statusCode).toBe(200);
     expect((await postCard(relay, older)).json().error).toBe('stale_descriptor');
     expect((await postCard(relay, newer)).statusCode).toBe(200);
@@ -380,7 +378,7 @@ describe('lookups and directory', () => {
     expect((await publishCard(relay, a, { listed: false, now: now() + 1 })).statusCode).toBe(200);
     expect(await relay.redis.zscore('ace:descriptors', a.aceId)).toBeNull();
     expect((await publishCard(relay, a, { listed: true, now: now() + 2 })).statusCode).toBe(200);
-    expect((await unregister(a, now() + 3)).statusCode).toBe(200);
+    expect((await unregister(relay, a, now() + 3)).statusCode).toBe(200);
     expect(await relay.redis.zscore('ace:descriptors', a.aceId)).toBeNull();
   });
 });

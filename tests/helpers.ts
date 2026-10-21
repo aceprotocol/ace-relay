@@ -104,6 +104,10 @@ export async function register(relay: TestRelay, agent: Agent, timestamp?: numbe
   return relay.app.inject({ method: 'POST', url: '/v1/register', payload: await createRegistrationRequest(agent.id, { audience: RELAY_URL, timestamp: timestamp }) });
 }
 
+export async function unregister(relay: TestRelay, agent: Agent, timestamp = now() + 1) {
+  return relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(agent, { action: 'unregister' }, timestamp) });
+}
+
 export async function registered(relay: TestRelay): Promise<Agent> {
   const a = await newAgent();
   const res = await register(relay, a);

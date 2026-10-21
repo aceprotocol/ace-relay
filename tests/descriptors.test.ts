@@ -4,8 +4,8 @@ import {
   type JSONObject, type KelEvent, type PublishedAgent, type SoftwareIdentityExport,
 } from '@ace-protocol/sdk';
 import {
-  BAD_RELAY_URLS, RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register,
-  registered, resign, send, type Agent, type TestRelay,
+  BAD_RELAY_URLS, RELAY_URL, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, register,
+  registered, resign, send, unregister, type Agent, type TestRelay,
 } from './helpers.js';
 
 let relay: TestRelay;
@@ -123,8 +123,7 @@ describe('POST /v1/descriptor', () => {
     expect((await register(relay, a, t0 + 1)).json().status).toBe('rotated');
     const old = await descriptorOf(a, { now: t0 });
     expect((await post(old)).statusCode).toBe(200);
-    const unregister = await relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(a, { action: 'unregister' }, t0 + 2) });
-    expect(unregister.statusCode).toBe(200);
+    expect((await unregister(relay, a, t0 + 2)).statusCode).toBe(200);
     const ts = t0 + 5;
     const recovered = await recoverRedelegating(a, copy, ts);
     expect((await register(relay, recovered, ts)).statusCode).toBe(200);

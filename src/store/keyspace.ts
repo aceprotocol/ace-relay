@@ -68,3 +68,14 @@ export function handleKey(handle: string): string {
 export function queueKeys(aceId: string): [string, string, string, string] {
   return [INBOX_KEY_PREFIX + aceId, INBOX_META_KEY_PREFIX + aceId, INBOX_DEDUP_KEY_PREFIX + aceId, INBOX_STRANGERS_KEY_PREFIX + aceId];
 }
+
+/** The identity hash fields `activeLastHash` takes, in order. */
+export const ACTIVE_FIELDS = ['lastHash', 'signingPublicKey', 'retiredAt'] as const;
+
+/**
+ * The registered KEL's lastHash of an active identity (ACTIVE_FIELDS values), else null. A published document
+ * (descriptor, card record) counts only while its stored lastHash is this one (07 § Descriptors and cards).
+ */
+export function activeLastHash([lastHash, signingPublicKey, retiredAt]: (string | null)[]): string | null {
+  return signingPublicKey !== null && retiredAt === null ? lastHash : null;
+}
