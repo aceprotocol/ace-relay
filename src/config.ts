@@ -78,8 +78,9 @@ export interface RelayConfig {
   sseWriteTimeoutMs: number;
 
   /**
-   * Wake hints (07 § Wake hints): the gateways a registration may name, as canonical https URLs compared exactly; `*`
-   * alone accepts any public https gateway. Empty (the default) offers no wake hints: both routes answer 404 not_found.
+   * Wake hints (07 § Wake hints): the gateways a registration may name, as canonical https URLs compared exactly (a relay
+   * SHOULD accept only gateways its operator lists, so there is no wildcard). Empty (the default) offers no wake hints:
+   * both routes answer 404 not_found.
    */
   wakeGateways: string[];
   /** Least interval between two wakes of one identity; a wake due sooner is deferred, never dropped. */
@@ -88,8 +89,6 @@ export interface RelayConfig {
   wakeTimeoutMs: number;
 }
 
-/** WAKE_GATEWAYS value accepting any public https gateway. */
-export const ANY_WAKE_GATEWAY = '*';
 
 /** `address/prefix` CIDRs (IPv4 or IPv6), parsed once into matchers. A malformed entry throws. */
 export function parseCidrs(list: readonly string[]): TrustedNetwork[] {
@@ -201,19 +200,19 @@ export function validateConfig(c: RelayConfig, production = process.env.NODE_ENV
   ] as const) {
     if (value < 1) throw new Error(`${name}=${value}: must be at least 1`);
   }
-  if (c.wakeGateways.includes(ANY_WAKE_GATEWAY) && c.wakeGateways.length !== 1) throw new Error(`WAKE_GATEWAYS: '${ANY_WAKE_GATEWAY}' must stand alone`);
   for (const g of c.wakeGateways) {
-    if (g !== ANY_WAKE_GATEWAY && !isCanonicalRelayUrl(g, { allowLoopback: false })) throw new Error(`WAKE_GATEWAYS: ${g} must be a canonical https URL`);
+    if (g === '*') throw new Error('WAKE_GATEWAYS: list the accepted gateways; \'*\' (any gateway) is not supported (07 § Wake hints)');
+    if (!isCanonicalRelayUrl(g, { allowLoopback: false })) throw new Error(`WAKE_GATEWAYS: ${g} must be a canonical https URL`);
   }
   return c;
 }
 
 /**
- * Whether a wake registration may name `gateway` (07 § Wake hints): a listed gateway (validated at startup), or with
- * `*` any canonical https URL. The wake request itself only reaches public addresses.
+ * Whether a wake registration may name `gateway` (07 § Wake hints): only a gateway the operator lists (validated at
+ * startup). The wake request itself only reaches public addresses.
  */
 export function acceptsGateway(c: RelayConfig, gateway: string): boolean {
-  return c.wakeGateways[0] === ANY_WAKE_GATEWAY ? isCanonicalRelayUrl(gateway, { allowLoopback: false }) : c.wakeGateways.includes(gateway);
+  return c.wakeGateways.includes(gateway);
 }
 
 export function loadConfig(production = process.env.NODE_ENV === 'production'): RelayConfig {

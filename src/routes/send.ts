@@ -47,12 +47,15 @@ export async function sendRoutes(app: FastifyInstance, deps: SendDeps): Promise<
     sdk(() => checkPacketTime(packet, now));
     const json = JSON.stringify(packet);
     const digest = sha256Hex(json);
-    const [recipient, queued] = await Promise.all([identityStore.read(packet.to), messageStore.isQueued(packet.to, digest)]);
-    if (!recipient) throw notPermitted();
-    // 2. A byte-identical packet already queued is accepted again without enqueuing.
+    const [recipient, blocked, queued] = await Promise.all([
+      identityStore.read(packet.to), blocks.isBlocked(packet.to, packet.from), messageStore.isQueued(packet.to, digest),
+    ]);
+    // 2. A registered recipient that has not blocked `from`. Blocks win over permits and come before the queue is
+    // consulted or any bucket charged, so a blocked sender's resend learns nothing of the queue; answered like every
+    // other refusal.
+    if (!recipient || blocked) throw notPermitted();
+    // 3. A byte-identical packet already queued is accepted again without enqueuing.
     if (queued) return { ok: true };
-    // 3. Blocks win over permits and come before any bucket is charged; answered like every other refusal.
-    if (await blocks.isBlocked(packet.to, packet.from)) throw notPermitted();
     const network = networkOf(req);
     let kind: 'normal' | 'stranger';
     if (body.permit !== undefined) {

@@ -34,6 +34,26 @@ describe('POST /v1/descriptor', () => {
     const sameSecond = await descriptorOf(a, { now: t, relays: [RELAY_URL, 'https://elsewhere.test'] });
     expect((await relay.app.inject({ method: 'POST', url: '/v1/descriptor', payload: sameSecond })).json().error).toBe('stale_descriptor');
   });
+
+  // Review 2026-10-21 SP2: a stored descriptor whose kel is not the registered KEL is absent (07 § Descriptors and cards).
+  it('a descriptor under a superseded KEL is absent: not served, and no bar to the new KEL\'s descriptor', async () => {
+    const a = await registered(relay);
+    // A holder of the signing key dates a descriptor as far ahead as verification allows.
+    const ahead = now() + 250;
+    expect((await publish(relay, a, { now: ahead })).statusCode).toBe(200);
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().descriptor.issuedAt).toBe(ahead);
+    await a.id.delegate();
+    expect((await register(relay, a, now() + 1)).json().status).toBe('rotated');
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().error).toBe('unknown_peer');
+    // The owner's descriptor under the new KEL replaces it although older.
+    const t = now();
+    expect((await publish(relay, a, { now: t })).json()).toEqual({ ok: true });
+    const served = (await get(`/v1/descriptor/${a.aceId}`)).json();
+    expect(served.descriptor.issuedAt).toBe(t);
+    expect(served.kel).toEqual(a.id.getKel());
+    // Under one KEL issuedAt still only moves forward.
+    expect((await publish(relay, a, { now: t - 1 })).json().error).toBe('stale_descriptor');
+  });
 });
 
 describe('depth (02 § JSON values)', () => {

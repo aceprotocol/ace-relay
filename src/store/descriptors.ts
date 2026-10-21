@@ -10,12 +10,19 @@ export type PublishStatus = 'published' | 'not_registered' | 'kel_conflict' | 's
  * KEYS: descriptor hash, identity hash. ARGV: aceId, issuedAt, claims digest, json, lastHash, expiresAt, profile ids
  * (space separated), then the ByteBudget. The json's bytes (jb) are charged to the network the identity registered from
  * (07 § Descriptors and cards); a larger document is refused while the store is at the relay-wide high-water mark
- * (`relay_busy`). The directory entry follows the card record (CardStore), not the descriptor.
+ * (`relay_busy`). The directory entry follows the card record (CardStore), not the descriptor. `issuedAt` must be newer than
+ * the stored descriptor's (or equal with the same digest) only while that one carries the registered KEL (07 § Descriptors
+ * and cards: a stored descriptor under another KEL is absent).
  */
 const PUBLISH_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + `
 if not isActive(KEYS[2]) then return 'not_registered' end
 if redis.call('HGET', KEYS[2], 'lastHash') ~= ARGV[5] then return 'kel_conflict' end
-local at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1')
+-- A descriptor stored under a superseded KEL is absent, so it cannot hold back the owner's descriptor under the new KEL
+-- (a stolen signing key can date one up to TIMESTAMP_WINDOW_SECONDS ahead). Without a stored lastHash (only the
+-- issuedAt and digest kept across unregister) the horizon still binds.
+local stored = redis.call('HGET', KEYS[1], 'lastHash')
+local at = -1
+if not stored or stored == ARGV[5] then at = tonumber(redis.call('HGET', KEYS[1], 'issuedAt') or '-1') end
 local issuedAt = tonumber(ARGV[2])
 if at > issuedAt then return 'stale_descriptor' end
 if at == issuedAt and redis.call('HGET', KEYS[1], 'digest') ~= ARGV[3] then return 'stale_descriptor' end

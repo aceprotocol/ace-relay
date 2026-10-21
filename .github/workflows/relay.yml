@@ -238,7 +238,7 @@ jobs:
           FLUSH_ONCE: ${{ inputs.flush_once == true && 'true' || 'false' }}
         run: |
           # Interpolated into the remote script below: URL characters only (the relay validates the URLs at startup).
-          [[ "$WAKE_GATEWAYS" =~ ^[A-Za-z0-9.:/_*,-]*$ ]] || { echo "WAKE_GATEWAYS has unexpected characters" >&2; exit 1; }
+          [[ "$WAKE_GATEWAYS" =~ ^[A-Za-z0-9.:/_,-]*$ ]] || { echo "WAKE_GATEWAYS has unexpected characters" >&2; exit 1; }
           # Build SSM commands as JSON array (each element = one script line)
           #
           # The host's reverse proxy is the only way in: app and metrics ports bind loopback,

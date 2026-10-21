@@ -114,7 +114,7 @@ the notify channel); a stream also closes before writing a packet once the regis
 longer current, which covers a lost notice and re-registration.
 
 **Wake hints** (optional, 07 § Wake hints). Off unless `WAKE_GATEWAYS` lists gateways (both routes are then
-`404 not_found`). `PUT /v1/wake {gateway, token}` stores one registration per identity, armed, charged 3 KiB to the
+`404 not_found`); a registration may name only a listed gateway (`400 invalid_argument`). `PUT /v1/wake {gateway, token}` stores one registration per identity, armed, charged 3 KiB to the
 identity's registration network once; `DELETE` removes it and its charge. After a send's response is written, an entry
 queued for an identity whose registration is armed and that has no open listen stream on any instance (Valkey `PUBSUB
 NUMSUB` of its notify channel) disarms it and sends one `POST <gateway>` with body `{"token": <token>}` (public DNS
@@ -172,7 +172,7 @@ Superseded keys therefore cannot roll the identity back here.
 | `SSE_PER_IDENTITY` / `GLOBAL_SSE_LIMIT` | 3 / 10000 | listen stream bounds (`rate_limited`) |
 | `HEARTBEAT_INTERVAL_MS` / `SSE_CATCHUP_LIMIT` / `DRAIN_MS` | 25000 / 200 / 10000 | listen heartbeat, read page, shutdown drain |
 | `SSE_WRITE_TIMEOUT_MS` | 30000 | a listen stream whose output does not drain in time is destroyed |
-| `WAKE_GATEWAYS` | unset | comma-separated canonical gateway URLs a wake registration may name (exact match); `*` alone accepts any public https gateway; unset offers no wake hints. A loopback `http://` gateway is accepted outside production only |
+| `WAKE_GATEWAYS` | unset | comma-separated canonical `https` gateway URLs a wake registration may name (exact match). Only listed gateways are accepted (07 § Wake hints: a relay SHOULD accept only gateways its operator lists): there is no wildcard, and `*` fails startup. A registration naming a gateway no longer listed is not woken. Unset offers no wake hints |
 | `WAKE_MIN_INTERVAL_SECONDS` / `WAKE_TIMEOUT_MS` | 30 / 5000 | least interval between two wakes of one identity (later ones are deferred); bound of one wake request |
 
 Integer variables must be plain non-negative integers; a malformed value fails startup. Protocol limits are fixed:

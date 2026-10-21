@@ -194,6 +194,21 @@ describe('POST /v1/send admission is not an oracle', () => {
       expect(res.json()).toEqual({ error: 'not_permitted', message: 'not permitted' });
     }
   });
+
+  // Review 2026-10-21 SP7: the block check precedes the identical-bytes check (07 § Send steps 2–3).
+  it('a blocked sender resending a packet still queued gets not_permitted, not the queue state', async () => {
+    const to = await published(relay), from = await newAgent();
+    const pm = await permit(to, from);
+    const p = await packet(from, to);
+    expect((await send(relay, p, pm)).statusCode).toBe(200);
+    expect(await queued(to.aceId)).toBe(1);
+    expect((await block(relay, to, from.aceId, true, 1)).statusCode).toBe(200);
+    for (const res of [await send(relay, p, pm), await send(relay, p)]) {
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toEqual({ error: 'not_permitted', message: 'not permitted' });
+    }
+    expect(await queued(to.aceId)).toBe(1);
+  });
 });
 
 const big = (from: Parameters<typeof packet>[0], to: Parameters<typeof packet>[1]) => packet(from, to, { message: 'y'.repeat(1_100_000) });

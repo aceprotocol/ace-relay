@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OFFLINE_WINDOW_SECONDS } from '@ace-protocol/sdk';
 import { WAKE_BYTES } from '../src/store/wake.js';
+import { acceptsGateway } from '../src/config.js';
 import {
   authHeaders, createTestRelay, deleteWake, inbox, newAgent, now, packet, permit, published, putWake, register, send, testConfig, wakeOf,
   type TestRelay,
@@ -218,9 +219,18 @@ describe('minimum interval', () => {
 
 describe('config', () => {
   it('validates WAKE_GATEWAYS', () => {
-    expect(() => testConfig({ wakeGateways: ['*', GATEWAY] })).toThrow(/stand alone/);
     expect(() => testConfig({ wakeGateways: ['http://push.example'] })).toThrow(/WAKE_GATEWAYS/);
     expect(() => testConfig({ wakeGateways: ['http://127.0.0.1:9999'] })).toThrow(/WAKE_GATEWAYS/);
-    expect(testConfig({ wakeGateways: ['*'] }).wakeGateways).toEqual(['*']);
+    expect(testConfig({ wakeGateways: [GATEWAY, 'https://other.example'] }).wakeGateways).toEqual([GATEWAY, 'https://other.example']);
+  });
+
+  // Review 2026-10-21 SP8: a relay SHOULD accept only gateways its operator lists (07 § Wake hints): no wildcard.
+  it('accepts only listed gateways: no wildcard', () => {
+    expect(() => testConfig({ wakeGateways: ['*'] })).toThrow(/WAKE_GATEWAYS/);
+    expect(() => testConfig({ wakeGateways: ['*', GATEWAY] })).toThrow(/WAKE_GATEWAYS/);
+    const c = testConfig({ wakeGateways: [GATEWAY] });
+    expect(acceptsGateway(c, GATEWAY)).toBe(true);
+    expect(acceptsGateway(c, 'https://unlisted.example')).toBe(false);
+    expect(acceptsGateway(c, `${GATEWAY}/`)).toBe(false);
   });
 });

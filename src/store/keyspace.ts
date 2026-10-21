@@ -14,7 +14,9 @@
  * |                   |        | epochStartHash, lastSeq + lastHash, descriptor issuedAt + digest, card    |
  * |                   |        | cardIssuedAt + cardDigest                                                 |
  * | descriptor:<id>   | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
- * |                   |        | expiresAt/profiles/jb (charged json bytes) until unregister                |
+ * |                   |        | expiresAt/profiles/jb (charged json bytes) until unregister; absent       |
+ * |                   |        | (not served, no bar to publishing) while lastHash is not the registered   |
+ * |                   |        | KEL's                                                                     |
  * | card:<id>         | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
  * |                   |        | contact/listed/jb (charged json bytes) until unregister; no TTL while     |
  * |                   |        | registered; ignored while lastHash is not the registered KEL's            |
