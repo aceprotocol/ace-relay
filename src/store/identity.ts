@@ -2,7 +2,7 @@ import type Redis from 'ioredis';
 import { OFFLINE_WINDOW_SECONDS, isACEId, sha256Hex, type KelEvent } from '@ace-protocol/sdk';
 import { RelayError } from '../errors.js';
 import {
-  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
+  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, DIRECTORY_TAG_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
   queueKeys,
 } from './keyspace.js';
 import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, RUNS_WHEN_FULL, budgetArgs, type ByteBudget } from './lua.js';
@@ -103,7 +103,7 @@ elseif ARGV[7] ~= '' or ARGV[8] ~= '' then
   return 'retry'
 end
 local rn, kb = ARGV[9], #ARGV[1]
--- A stored descriptor and card record (jb: their json bytes; both are deleted at unregister).
+-- A stored descriptor and card record (jb: their charged bytes; both are deleted at unregister).
 local jb = tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') + tonumber(redis.call('HGET', KEYS[4], 'jb') or '0')
 -- Block records (bb) and the wake registration (wb) belong to an active identity only (unregister deletes them).
 local bb, wb = 0, 0
@@ -137,10 +137,10 @@ return status
 // KEYS: identity, descriptor, directory, blocks, inbox, inbox-meta, inbox-dedup, inbox-strangers, horizon, card. ARGV:
 // auth timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
 // It frees far more than the horizon it writes, so it runs even when the store is full. Deletes queue, descriptor
-// document, card record document, directory entry and blocks; keeps the KEL, the descriptor's and card record's
+// document, card record document, directory entries and blocks; keeps the KEL, the descriptor's and card record's
 // issuedAt/digest and a retiredAt barrier for OFFLINE_WINDOW_SECONDS, and the fixed-size horizon (Horizon) forever
-// (07 § Registration). The handle binding stays forever (07 § Descriptors and cards). The wake registration (derived
-// key) goes too. The descriptor's, card record's, blocks' and wake charges are released; the KEL's lapses with the
+// (07 § Registration). The handle binding and its skeleton stay forever (07 § Descriptors and cards). The wake
+// registration and the card's directory-tag entries (derived keys, named by the card's `tags`) go too. The descriptor's, card record's, blocks' and wake charges are released; the KEL's lapses with the
 // packet window.
 const UNREGISTER_IDENTITY_SCRIPT = RUNS_WHEN_FULL + IDENTITY_LUA + BYTES_LUA + `
 if not isActive(KEYS[1]) then return 'not_registered' end
@@ -153,7 +153,10 @@ redis.call('HDEL', KEYS[1], 'bb', 'wb')
 redis.call('DEL', '${WAKE_KEY_PREFIX}' .. ARGV[2])
 retire(rn, tonumber(redis.call('HGET', KEYS[1], 'kb') or '0'), tonumber(ARGV[5]), tonumber(ARGV[6]))
 redis.call('HDEL', KEYS[2], 'json', 'lastHash', 'expiresAt', 'profiles', 'jb')
-redis.call('HDEL', KEYS[10], 'json', 'lastHash', 'contact', 'listed', 'jb')
+for tag in string.gmatch(redis.call('HGET', KEYS[10], 'tags') or '', '%S+') do
+  redis.call('ZREM', '${DIRECTORY_TAG_KEY_PREFIX}' .. tag, ARGV[2])
+end
+redis.call('HDEL', KEYS[10], 'json', 'lastHash', 'contact', 'listed', 'tags', 'jb')
 redis.call('ZREM', KEYS[3], ARGV[2])
 releaseQueue(KEYS[6])
 redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[7], KEYS[8])

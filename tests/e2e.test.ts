@@ -52,7 +52,7 @@ describe('NetworkClient through the relay', () => {
     const alice = await peer(urlA, { contact: 'open', listed: true, handle: 'alice' });
     const bob = await peer(urlA);
 
-    expect((await bob.client.discover()).agents.map((a) => a.descriptor.aceId)).toEqual([alice.aceId]);
+    expect((await bob.client.discover()).cards.map((c) => c.aceId)).toEqual([alice.aceId]);
     expect((await bob.client.lookup('@alice@relay-a.test')).descriptor.aceId).toBe(alice.aceId);
     expect((await bob.client.lookupCard('@alice@relay-a.test')).record).toMatchObject({ handle: 'alice', home: urlA, contact: 'open' });
     // bob takes no contact requests from strangers: alice cannot reach him first.

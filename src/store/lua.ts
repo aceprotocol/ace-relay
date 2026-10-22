@@ -142,9 +142,9 @@ end
  * with another digest. One stored under a superseded KEL is absent, so its issuedAt (a stolen signing key can date one
  * up to TIMESTAMP_WINDOW_SECONDS ahead) cannot hold back the owner's document under the new KEL; without a stored
  * lastHash (only the issuedAt and digest kept across unregister) the horizon still binds.
- * `chargeDocument(key, idKey, json, budget)`: charges the json's bytes over the stored jb to the identity's
- * registration network and returns nil, or refuses with `rate_limited` / `relay_busy` (`budget`: the ARGV index of the
- * first of the ByteBudget's five).
+ * `chargeDocument(key, idKey, size, budget)`: charges `size` (the json's bytes, plus any index entries the document
+ * keeps) over the stored jb to the identity's registration network and returns nil, or refuses with `rate_limited` /
+ * `relay_busy` (`budget`: the ARGV index of the first of the ByteBudget's five).
  */
 export const DOCUMENT_LUA = `
 local function isStale(key, lastHash, issuedAt, digest)
@@ -154,9 +154,9 @@ local function isStale(key, lastHash, issuedAt, digest)
   issuedAt = tonumber(issuedAt)
   return at > issuedAt or (at == issuedAt and redis.call('HGET', key, 'digest') ~= digest)
 end
-local function chargeDocument(key, idKey, json, budget)
+local function chargeDocument(key, idKey, size, budget)
   local rn = redis.call('HGET', idKey, 'regnet')
-  local delta = #json - tonumber(redis.call('HGET', key, 'jb') or '0')
+  local delta = size - tonumber(redis.call('HGET', key, 'jb') or '0')
   if rn and overBudget(rn, delta, tonumber(ARGV[budget]), tonumber(ARGV[budget + 1]), tonumber(ARGV[budget + 2]),
     tonumber(ARGV[budget + 3])) then return 'rate_limited' end
   if delta > 0 and atCapacity(tonumber(ARGV[budget + 4])) then return 'relay_busy' end

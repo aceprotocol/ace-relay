@@ -1,6 +1,6 @@
 import type Redis from 'ioredis';
-import { MAX_PAGE_BYTES, type PublishedAgent } from '@ace-protocol/sdk';
-import { ACTIVE_FIELDS, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, IDENTITY_KEY_PREFIX, activeLastHash } from './keyspace.js';
+import type { PublishedAgent } from '@ace-protocol/sdk';
+import { ACTIVE_FIELDS, DESCRIPTOR_KEY_PREFIX, IDENTITY_KEY_PREFIX, activeLastHash } from './keyspace.js';
 import { BYTES_LUA, CAPACITY_LUA, DOCUMENT_LUA, IDENTITY_LUA, MAY_GROW, budgetArgs, type ByteBudget } from './lua.js';
 import { parseStored } from '../errors.js';
 
@@ -20,7 +20,7 @@ const PUBLISH_SCRIPT = MAY_GROW + IDENTITY_LUA + BYTES_LUA + CAPACITY_LUA + DOCU
 if not isActive(KEYS[2]) then return 'not_registered' end
 if redis.call('HGET', KEYS[2], 'lastHash') ~= ARGV[5] then return 'kel_conflict' end
 if isStale(KEYS[1], ARGV[5], ARGV[2], ARGV[3]) then return 'stale_descriptor' end
-local refused = chargeDocument(KEYS[1], KEYS[2], ARGV[4], 8)
+local refused = chargeDocument(KEYS[1], KEYS[2], #ARGV[4], 8)
 if refused then return refused end
 redis.call('HSET', KEYS[1], 'issuedAt', ARGV[2], 'digest', ARGV[3], 'json', ARGV[4], 'lastHash', ARGV[5],
   'expiresAt', ARGV[6], 'profiles', ARGV[7], 'jb', #ARGV[4])
@@ -29,14 +29,7 @@ return 'published'
 
 type ScriptRedis = Redis & { publishDescriptor(...keysAndArgs: (string | number)[]): Promise<PublishStatus> };
 
-const FIELDS = ['json', 'lastHash', 'expiresAt', 'profiles'] as const;
-/** Directory entries one page may examine. */
-const DIRECTORY_SCAN_BUDGET = 1000;
-const DIRECTORY_BATCH = 200;
-
-interface Row { json: string; profiles: string[]; listed: boolean }
-
-/** Signed PublishedAgents and the directory of listed identities. Only complete signed documents are stored and served. */
+/** Signed PublishedAgents. Only complete signed documents are stored and served; the directory is CardStore's. */
 export class DescriptorStore {
   private readonly redis: ScriptRedis;
 
@@ -56,8 +49,16 @@ export class DescriptorStore {
 
   /** The stored, unexpired descriptor of an active identity whose KEL it carries. */
   async get(aceId: string, now: number): Promise<PublishedAgent | null> {
-    const [row] = await this.rows([aceId], now);
-    return row ? parseStored<PublishedAgent>(row.json, `descriptor of ${aceId}`) : null;
+    const res = await this.redis.pipeline()
+      .hmget(DESCRIPTOR_KEY_PREFIX + aceId, 'json', 'lastHash', 'expiresAt')
+      .hmget(IDENTITY_KEY_PREFIX + aceId, ...ACTIVE_FIELDS)
+      .exec();
+    const [[e1, d], [e2, idn]] = res as [[Error | null, (string | null)[]], [Error | null, (string | null)[]]];
+    if (e1 || e2) throw e1 ?? e2;
+    const [json, lastHash, expiresAt] = d;
+    const current = activeLastHash(idn);
+    return json !== null && current !== null && lastHash === current && Number(expiresAt) > now
+      ? parseStored<PublishedAgent>(json, `descriptor of ${aceId}`) : null;
   }
 
   /**
@@ -67,56 +68,5 @@ export class DescriptorStore {
   async isLive(aceId: string, lastHash: string, now: number): Promise<boolean> {
     const [stored, expiresAt] = await this.redis.hmget(DESCRIPTOR_KEY_PREFIX + aceId, 'lastHash', 'expiresAt');
     return stored === lastHash && Number(expiresAt) > now;
-  }
-
-  /** Unexpired descriptors of listed identities ordered by ACE ID after `cursor`, optionally listing `profile`. */
-  async discover(cursor: string | undefined, limit: number, profile: string | undefined, now: number): Promise<{ agents: PublishedAgent[]; cursor: string | null }> {
-    const agents: PublishedAgent[] = [];
-    let bytes = 0;
-    let scanned = 0;
-    let after = cursor;
-    for (;;) {
-      const ids = await this.redis.zrangebylex(DIRECTORY_KEY, after ? `(${after}` : '-', '+', 'LIMIT', 0, DIRECTORY_BATCH);
-      const rows = await this.rows(ids, now);
-      for (let i = 0; i < ids.length; i++) {
-        const row = rows[i];
-        if (row && row.listed && (!profile || row.profiles.includes(profile))) {
-          const size = Buffer.byteLength(row.json) + 1;
-          if (agents.length > 0 && bytes + size > MAX_PAGE_BYTES) return { agents, cursor: after ?? null };
-          agents.push(parseStored<PublishedAgent>(row.json, `descriptor of ${ids[i]}`));
-          bytes += size;
-        }
-        after = ids[i];
-        scanned++;
-        if (agents.length === limit || scanned === DIRECTORY_SCAN_BUDGET) {
-          const more = i < ids.length - 1 || (await this.redis.zrangebylex(DIRECTORY_KEY, `(${after}`, '+', 'LIMIT', 0, 1)).length > 0;
-          return { agents, cursor: more ? after : null };
-        }
-      }
-      if (ids.length < DIRECTORY_BATCH) return { agents, cursor: null };
-    }
-  }
-
-  /** Rows of active identities whose stored descriptor carries their registered KEL and is unexpired, with whether their current card record is listed. */
-  private async rows(ids: string[], now: number): Promise<Array<Row | null>> {
-    if (ids.length === 0) return [];
-    const pipe = this.redis.pipeline();
-    for (const id of ids) {
-      pipe.hmget(DESCRIPTOR_KEY_PREFIX + id, ...FIELDS);
-      pipe.hmget(IDENTITY_KEY_PREFIX + id, ...ACTIVE_FIELDS);
-      pipe.hmget(CARD_KEY_PREFIX + id, 'listed', 'lastHash');
-    }
-    const res = (await pipe.exec()) ?? [];
-    return ids.map((_, i) => {
-      const [e1, d] = res[3 * i] as [Error | null, (string | null)[]];
-      const [e2, idn] = res[3 * i + 1] as [Error | null, (string | null)[]];
-      const [e3, card] = res[3 * i + 2] as [Error | null, (string | null)[]];
-      if (e1 || e2 || e3) throw e1 ?? e2 ?? e3;
-      const [json, lastHash, expiresAt, profiles] = d;
-      const current = activeLastHash(idn);
-      if (json === null || current === null || lastHash !== current || !(Number(expiresAt) > now)) return null;
-      // Listed only by a record published under the current KEL (CardStore).
-      return { json, profiles: (profiles ?? '').split(' ').filter(Boolean), listed: card[0] === '1' && card[1] === current };
-    });
   }
 }

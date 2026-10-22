@@ -1,8 +1,8 @@
 /**
  * Redis keyspace. Every key is built here from a validated ACE ID, handle or digest. Lua scripts receive the keys they
- * name from the request as KEYS and derive keys named by stored state: `regnet:<rn>` from the recipient's registration
- * network. This needs single-node Valkey (under Cluster these
- * scripts already span slots and would need hash tags).
+ * name from the request as KEYS and derive keys named by stored state or by a verified record's tags: `regnet:<rn>`
+ * from the recipient's registration network, `directory-tag:<tag>` from a card record's `tags` (stored and new). This
+ * needs single-node Valkey (under Cluster these scripts already span slots and would need hash tags).
  *
  * | prefix            | type   | lifetime                                                                  |
  * |-------------------|--------|---------------------------------------------------------------------------|
@@ -18,11 +18,16 @@
  * |                   |        | (not served, no bar to publishing) while lastHash is not the registered   |
  * |                   |        | KEL's                                                                     |
  * | card:<id>         | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
- * |                   |        | contact/listed/jb (charged json bytes) until unregister; no TTL while     |
- * |                   |        | registered; ignored while lastHash is not the registered KEL's            |
- * | descriptors       | zset   | directory: identities whose card record is listed (lex by ACE ID)         |
+ * |                   |        | contact/listed/tags (the tags indexed under directory-tag:)/jb (charged   |
+ * |                   |        | json and tag index bytes) until unregister; no TTL while registered;      |
+ * |                   |        | ignored while lastHash is not the registered KEL's                        |
+ * | descriptors       | zset   | directory: identities whose card record is listed at home (lex by ACE ID) |
+ * | directory-tag:<tag> | zset | the directory entries whose card lists <tag>; follows descriptors, its    |
+ * |                   |        | bytes charged in the card's jb; empty sets vanish                         |
  * | handle:<handle>   | string | owner ACE ID; permanent, never reassigned (no TTL, survives unregister)   |
  * | handleof:<id>     | string | the identity's handle at this relay; permanent like handle:<handle>       |
+ * | handle-skeleton:<s> | string | ACE ID of the bound handle with skeleton <s> (`handleSkeleton`);       |
+ * |                   |        | permanent like handle:<handle>                                            |
  * | blocks:<id>       | hash   | peer → "<revision>:<0|1>", until unregister                               |
  * | wake:<id>         | hash   | g (gateway), t (token), a (armed 1|0), w (last wake ms); expires          |
  * |                   |        | OFFLINE_WINDOW after the identity's last wake/inbox/ack/listen; deleted   |
@@ -47,6 +52,8 @@ export const DIRECTORY_KEY = 'ace:descriptors';
 export const CARD_KEY_PREFIX = 'ace:card:';
 export const HANDLE_KEY_PREFIX = 'ace:handle:';
 export const HANDLE_OF_KEY_PREFIX = 'ace:handleof:';
+export const HANDLE_SKELETON_KEY_PREFIX = 'ace:handle-skeleton:';
+export const DIRECTORY_TAG_KEY_PREFIX = 'ace:directory-tag:';
 export const BLOCKS_KEY_PREFIX = 'ace:blocks:';
 export const WAKE_KEY_PREFIX = 'ace:wake:';
 export const INBOX_KEY_PREFIX = 'ace:inbox:';
@@ -62,6 +69,19 @@ export const NOTIFY_KEY_PREFIX = 'ace:notify:';
 /** The key of a claimed handle; '' (no handle) names a placeholder key a script may declare but never holds. */
 export function handleKey(handle: string): string {
   return HANDLE_KEY_PREFIX + (handle || '-');
+}
+
+/**
+ * A handle's skeleton (07 § Descriptors and cards): its hyphens removed, `0` read as `o` and `1` as `l`, so
+ * `alice-bot`, `alicebot` and `a1icebot` share one.
+ */
+export function handleSkeleton(handle: string): string {
+  return handle.replaceAll('-', '').replaceAll('0', 'o').replaceAll('1', 'l');
+}
+
+/** The skeleton key of a handle; '' names a placeholder like `handleKey` (no skeleton is '-'). */
+export function handleSkeletonKey(handle: string): string {
+  return HANDLE_SKELETON_KEY_PREFIX + (handle ? handleSkeleton(handle) : '-');
 }
 
 /** The four keys of one recipient queue, in the order the queue scripts take them. */

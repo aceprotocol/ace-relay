@@ -24,7 +24,7 @@ describe('operations', () => {
   });
 
   it('a client address that is not an IP literal is invalid_argument, not a 500', async () => {
-    const res = await relay.app.inject({ method: 'GET', url: '/v1/descriptors', remoteAddress: 'not-an-ip' });
+    const res = await relay.app.inject({ method: 'GET', url: '/v1/cards', remoteAddress: 'not-an-ip' });
     expect([res.statusCode, res.json().error]).toEqual([400, 'invalid_argument']);
   });
 
@@ -33,7 +33,7 @@ describe('operations', () => {
     for (const [trustProxy, second] of [[false, 429], ['127.0.0.1', 200]] as const) {
       const r = await createTestRelay(10, { trustProxy, ipRateLimit: 1 });
       try {
-        const hit = (xff: string) => r.app.inject({ method: 'GET', url: '/v1/descriptors', headers: { 'x-forwarded-for': xff } });
+        const hit = (xff: string) => r.app.inject({ method: 'GET', url: '/v1/cards', headers: { 'x-forwarded-for': xff } });
         expect((await hit('198.51.100.1')).statusCode).toBe(200);
         expect((await hit('198.51.100.2')).statusCode).toBe(second);
       } finally {

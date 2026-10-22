@@ -182,9 +182,9 @@ describe('depth (02 § JSON values)', () => {
     expect((await post(ok)).statusCode).toBe(200);
     expect((await publishCard(relay, a, { listed: true })).statusCode).toBe(200);
 
-    const page = await get('/v1/descriptors?profile=x%3Adeep%3A1');
+    const page = await get('/v1/cards?profile=x%3Adeep%3A1');
     const client = new RelayClient(RELAY_URL, { fetch: async () => new Response(page.body, { status: 200, headers: { 'content-type': 'application/json' } }) });
-    expect((await client.listDescriptors({ profile: 'x:deep:1' })).agents.map((x) => x.descriptor.aceId)).toEqual([a.aceId]);
+    expect((await client.directory({ profile: 'x:deep:1' })).cards.map((x) => x.aceId)).toEqual([a.aceId]);
   });
 
   it('a packet is closed-shape (depth 2); a deeper or deeply nested send body is invalid_packet, never a crash', async () => {

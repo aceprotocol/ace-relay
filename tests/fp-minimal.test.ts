@@ -67,7 +67,7 @@ describe('A10 storage bounds', () => {
       expect(refused.json().error).toBe('rate_limited');
       expect(refused.headers['retry-after']).toMatch(/^[0-9]+$/);
       expect((await publish(r, a, { now: now() + 1, relays: [RELAY_URL, 'https://second.test'] })).json().error).toBe('rate_limited');
-      expect((await publishCard(r, a, { card: { name: 'a card' } })).json().error).toBe('rate_limited');
+      expect((await publishCard(r, a, { card: { description: 'a card' } })).json().error).toBe('rate_limited');
       // Other networks are unaffected.
       expect((await registerFrom(r, b, '198.51.100.8')).statusCode).toBe(200);
       expect((await publish(r, b)).statusCode).toBe(200);

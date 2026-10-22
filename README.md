@@ -14,7 +14,7 @@ between identities through one relay and across two; `tests/vectors.test.ts` rep
 `auth.registration.negative` vectors through the HTTP routes.
 
 Stack: Node 24, Fastify 5, Redis ≥ 6.2 / Valkey (streams, Lua), single node: scripts receive the keys named by the
-request and derive the keys named by stored state (`src/store/keyspace.ts`).
+request and derive the keys named by stored state or by a verified card's tags (`src/store/keyspace.ts`).
 
 ## API
 
@@ -27,7 +27,7 @@ request and derive the keys named by stored state (`src/store/keyspace.ts`).
 | `POST /v1/card` | card record signature | CardBundle | `{ok}` |
 | `GET /v1/card/{aceId}` | — | — | CardBundle |
 | `GET /v1/handles/{handle}` | — | — | CardBundle |
-| `GET /v1/descriptors?profile&cursor&limit` | — | — | `{agents, cursor}` (listed identities) |
+| `GET /v1/cards?tag&profile&cursor&limit` | — | — | `{cards: [CardBundle], cursor}` (the directory) |
 | `POST /v1/blocks` | `block` | `{peer, blocked, revision}` | `{ok}` |
 | `POST /v1/send` | permit or `contact: open` recipient | `{packet, permit?}` | `{ok}` |
 | `PUT /v1/wake` | `wake` | `{gateway, token}` | `{ok}` (only with `WAKE_GATEWAYS`) |
@@ -61,25 +61,35 @@ a descriptor. Handles are **set once, per home**, in the same script as the reco
 - a record whose `home` is another relay is stored but claims nothing here; a handle already bound here stays bound;
 - when `home` is this relay and a handle is bound to the identity here, the record must carry exactly that handle
   (omitting it or naming another is `400 invalid_argument`);
-- otherwise a record at home naming a handle binds it permanently (`409 handle_taken` if another identity holds it).
-  New bindings are limited to `HANDLE_CLAIMS_PER_NETWORK_PER_DAY` (8) per client network (`429 rate_limited`, with
+- otherwise a record at home naming a handle binds it permanently (`409 handle_taken` if another identity holds it,
+  or holds a handle with the same skeleton: the handle with `-` removed, `0` read as `o` and `1` as `l`, so
+  `alice-bot`, `alicebot` and `a1icebot` cannot be held by different identities). New bindings are limited to `HANDLE_CLAIMS_PER_NETWORK_PER_DAY` (8) per client network (`429 rate_limited`, with
   `Retry-After`).
 
-A binding (`ace:handle:<h>` → ACE ID, `ace:handleof:<id>` → handle) has no TTL and is never released: not by a new
+Handles match `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, 3–32 characters (the SDK's `isHandle`). A binding (`ace:handle:<h>` →
+ACE ID, `ace:handleof:<id>` → handle, `ace:handle-skeleton:<s>` → ACE ID) has no TTL and is never released: not by a new
 record, not by moving `home`, not by unregister. `GET /v1/handles/{handle}` serves the bound identity's stored
 CardBundle only while that record names this relay as `home` and carries the handle, else `unknown_peer`.
 `GET /v1/card/{aceId}` serves the stored record of a registered identity. A record is bound to the KEL it was
 published under: after any KEL change (`dlg`, `rot`, recovery) it is treated as absent (not served, not listed,
 `closed` for send) until the identity republishes a re-signed record; the handle binding is unaffected. **Agents must
-republish their card record after every KEL change** (the SDK's upkeep does this). The directory lists identities whose stored record names this
-relay as `home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most 100 agents and 8 MiB
-per page, scanning at most 1000 entries; continue until `cursor: null`.
+republish their card record after every KEL change** (the SDK's upkeep does this).
+
+**Directory.** `GET /v1/cards` serves the stored CardBundles of identities whose current record names this relay as
+`home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most `limit` (1..100, default 20)
+entries and 8 MiB per page (at least one entry when any remain), scanning at most 1000 entries; continue until
+`cursor: null`. `tag` (`^[a-z0-9-]{1,32}$`, else `400 invalid_argument`) keeps the records listing that tag and reads
+a per-tag index (`ace:directory-tag:<tag>`) the card script keeps beside the directory set, so a tag query scans only
+that tag's entries; `profile` keeps the identities whose stored descriptor lists that profile ID (a filtered scan
+within the same budget). The index entries' bytes are charged with the record. Ranking and text search are not relay
+functions.
 
 **Permanent names and squatting.** Because a handle is never reassigned, a name claimed by an identity that is later
 abandoned stays unusable for everyone. That is the price of handles nobody can take over. The relay bounds it with
 `HANDLE_CLAIMS_PER_NETWORK_PER_DAY` per client network, plus the registration rate and byte budgets every claim also
-passes. The spec also lets a relay reserve handles under a naming policy (answered `handle_taken`). This relay does not
-implement such a policy yet; it is the place for a future operator hook (reserved or offensive names, trademark
+passes. The skeleton rule keeps look-alike handles from being split between identities. The spec also lets a relay
+reserve handles under a naming policy (answered `handle_taken`, skeletons included). This relay does not implement such
+a policy yet; it is the place for a future operator hook (reserved or offensive names, trademark
 disputes).
 
 **Blocks.** Signed `{peer, blocked, revision}` with a strictly increasing revision per peer (`stale_revision`), kept
@@ -130,8 +140,8 @@ bytes are charged to the registering network's byte budget (`429 rate_limited` w
 same timestamp and digest → `idempotent`; newer timestamp, same last event → `refreshed`; extended or recovered KEL →
 `rotated`; strict prefix → `stale_seq`; fork → `kel_conflict`; older timestamp, equal timestamp with another digest,
 or at or below the unregister barrier → `identity_conflict`. `unregister` needs an auth timestamp newer than the
-registration; it deletes queue, descriptor and card record documents, directory entry, blocks and wake registration atomically and closes listen
-streams; the handle binding stays. The KEL, the descriptor's and card record's newest `issuedAt`/digest and the barrier are kept for `OFFLINE_WINDOW_SECONDS`
+registration; it deletes queue, descriptor and card record documents, directory and tag index entries, blocks and wake registration atomically and closes listen
+streams; the handle binding and its skeleton stay. The KEL, the descriptor's and card record's newest `issuedAt`/digest and the barrier are kept for `OFFLINE_WINDOW_SECONDS`
 (their keys expire then), so a re-registration within that period must extend that history (or recover it, 01 rule
 6). A fixed-size **horizon** stays forever (`ace:horizon:<id>`): the barrier, the descriptor's and card record's `issuedAt`/digest, the
 seq and hash of the KEL's last root-epoch event (its last `icp` or `rot`) and of its last event. After the KEL expired,

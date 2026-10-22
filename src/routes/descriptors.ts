@@ -19,6 +19,8 @@ const directorySchema = {
     type: 'object',
     additionalProperties: false,
     properties: {
+      // TAG_RE (04 § Card); the SDK does not export it.
+      tag: { type: 'string', pattern: '^[a-z0-9-]{1,32}$' },
       profile: { type: 'string', maxLength: 256 },
       cursor: { type: 'string', maxLength: 512 },
       limit: { type: 'integer', minimum: 1, maximum: MAX_INBOX_PAGE },
@@ -97,11 +99,11 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     return bundle;
   });
 
-  app.get('/v1/descriptors', { schema: directorySchema }, async (req: FastifyRequest) => {
+  app.get('/v1/cards', { schema: directorySchema }, async (req: FastifyRequest) => {
     await enforceRate(rateLimiter, `directory:${clientOf(req)}`, config.discoverRateLimit, 60, 'network');
-    const q = req.query as { profile?: string; cursor?: string; limit?: number };
+    const q = req.query as { tag?: string; profile?: string; cursor?: string; limit?: number };
     if (q.cursor !== undefined && !isACEId(q.cursor)) throw new RelayError('invalid_argument', 'invalid cursor');
-    return descriptors.discover(q.cursor, q.limit ?? DEFAULT_PAGE_LIMIT, q.profile, clock());
+    return cards.directory({ cursor: q.cursor, limit: q.limit ?? DEFAULT_PAGE_LIMIT, tag: q.tag, profile: q.profile, now: clock() });
   });
 
   app.post('/v1/blocks', { schema: blockSchema }, async (req: FastifyRequest) => {

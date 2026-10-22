@@ -1,6 +1,6 @@
 // 07 § Descriptors and cards: card records, set-once handles, the listed directory and the open-contact send rule.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
+import { MAX_INBOX_PAGE, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
 import { HORIZON_BYTES } from '../src/store/identity.js';
 import {
   BAD_RELAY_URLS, RELAY_URL, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
@@ -20,7 +20,7 @@ const OTHER_HOME = 'https://other.test';
 describe('POST /v1/card', () => {
   it('publishes and serves a card', async () => {
     const a = await registered(relay);
-    const bundle = await cardOf(a, { card: { name: 'Alice' }, contact: 'open', listed: false });
+    const bundle = await cardOf(a, { card: { description: 'Alice' }, contact: 'open', listed: false });
     expect((await postCard(relay, bundle)).json()).toEqual({ ok: true });
     const res = await get(`/v1/card/${a.aceId}`);
     expect(res.statusCode).toBe(200);
@@ -230,8 +230,8 @@ describe('handles', () => {
     const inDirectory = async () => {
       const ids: string[] = [];
       for (let cursor: string | null = null; ;) {
-        const page = (await get(`/v1/descriptors?limit=100${cursor ? `&cursor=${cursor}` : ''}`)).json();
-        ids.push(...page.agents.map((x: any) => x.descriptor.aceId));
+        const page = (await get(`/v1/cards?limit=100${cursor ? `&cursor=${cursor}` : ''}`)).json();
+        ids.push(...page.cards.map((x: any) => x.card.aceId));
         if (!(cursor = page.cursor)) return ids.includes(a.aceId);
       }
     };
@@ -253,6 +253,32 @@ describe('handles', () => {
     expect((await send(relay, await packet(from, a))).json()).toEqual({ ok: true });
     // Leave the directory to the directory test.
     expect((await publishCard(relay, a, { handle: 'rotor', now: now() + 3 })).statusCode).toBe(200);
+  });
+
+  it('a handle whose skeleton another identity holds is handle_taken', async () => {
+    const a = await registered(relay), b = await registered(relay), c = await registered(relay);
+    expect((await publishCard(relay, a, { handle: 'skel-bot' })).statusCode).toBe(200);
+    expect(await relay.redis.get('ace:handle-skeleton:skelbot')).toBe(a.aceId);
+    for (const similar of ['skelbot', 'ske1bot', 'ske-l-bot', 'skel-b0t']) {
+      expect((await publishCard(relay, b, { handle: similar })).json().error).toBe('handle_taken');
+      expect(await relay.redis.exists(`ace:handle:${similar}`)).toBe(0);
+    }
+    expect(await relay.redis.exists(`ace:handleof:${b.aceId}`)).toBe(0);
+    expect((await publishCard(relay, b, { handle: 'skel-bots' })).statusCode).toBe(200);
+    // The skeleton key outlives unregister like the binding.
+    expect((await unregister(relay, a, now() + 1)).statusCode).toBe(200);
+    expect((await publishCard(relay, c, { handle: 'ske1-bot' })).json().error).toBe('handle_taken');
+  });
+
+  it('handle grammar: hyphens only between letters or digits, 3-32 characters', async () => {
+    const a = await registered(relay);
+    const b = await cardOf(a, { handle: 'placeholder' });
+    for (const bad of ['under_score', 'trailing-', 'double--dash', '9lives', 'ab', 'x'.repeat(33)]) {
+      const res = await postCard(relay, { kel: b.kel, card: await resign(a, 'card-record', { ...b.card, handle: bad }) });
+      expect(res.json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringContaining('handle') });
+      expect((await get(`/v1/handles/${bad}`)).json().error).toBe('unknown_peer');
+    }
+    expect((await publishCard(relay, a, { handle: `a${'1'.repeat(31)}` })).statusCode).toBe(200);
   });
 
   it('handle stays bound while card is dark', async () => {
@@ -355,16 +381,24 @@ describe('lookups and directory', () => {
     const noDescriptor = await registered(relay);
     expect((await publishCard(relay, noDescriptor, { listed: true })).statusCode).toBe(200);
     agents.sort();
-    const page1 = (await get('/v1/descriptors?limit=3')).json();
-    expect(page1.agents.map((x: any) => x.descriptor.aceId)).toEqual(agents.slice(0, 3));
+    const ids = (page: any) => page.cards.map((x: CardBundle) => x.card.aceId);
+    const page1 = (await get('/v1/cards?limit=3')).json();
+    expect(ids(page1)).toEqual(agents.slice(0, 3));
+    expect(page1.cards[0]).toEqual((await get(`/v1/card/${agents[0]}`)).json());
     expect(page1.cursor).toBe(agents[2]);
-    const page2 = (await get(`/v1/descriptors?limit=3&cursor=${page1.cursor}`)).json();
-    expect(page2.agents.map((x: any) => x.descriptor.aceId)).toEqual(agents.slice(3));
+    const page2 = (await get(`/v1/cards?limit=3&cursor=${page1.cursor}`)).json();
+    expect(ids(page2)).toEqual(agents.slice(3));
     expect(page2.cursor).toBeNull();
-    expect((await get('/v1/descriptors?profile=ace:text:1')).json().agents).toHaveLength(4);
-    expect((await get('/v1/descriptors?profile=ace:commerce:1')).json()).toEqual({ agents: [], cursor: null });
-    expect((await get('/v1/descriptors?limit=0')).json().error).toBe('invalid_argument');
-    expect((await get('/v1/descriptors?cursor=x')).json().error).toBe('invalid_argument');
+    expect(ids((await get('/v1/cards?profile=ace:text:1')).json())).toHaveLength(4);
+    expect((await get('/v1/cards?profile=ace:commerce:1')).json()).toEqual({ cards: [], cursor: null });
+    expect((await get('/v1/cards?limit=0')).json().error).toBe('invalid_argument');
+    expect((await get(`/v1/cards?limit=${MAX_INBOX_PAGE + 1}`)).json().error).toBe('invalid_argument');
+    expect((await get('/v1/cards?cursor=x')).json().error).toBe('invalid_argument');
+    for (const tag of ['UPPER', 'a_b', 'x'.repeat(33), '']) {
+      const res = await get(`/v1/cards?tag=${tag}`);
+      expect([res.statusCode, res.json().error]).toEqual([400, 'invalid_argument']);
+    }
+    expect((await get('/v1/descriptors')).statusCode).toBe(404);
     // Unlisting removes the entry.
     const [first] = agents;
     const self = (await get(`/v1/card/${first}`)).json() as CardBundle;
@@ -380,6 +414,70 @@ describe('lookups and directory', () => {
     expect((await publishCard(relay, a, { listed: true, now: now() + 2 })).statusCode).toBe(200);
     expect((await unregister(relay, a, now() + 3)).statusCode).toBe(200);
     expect(await relay.redis.zscore('ace:descriptors', a.aceId)).toBeNull();
+  });
+
+  it('tag filter reads a per-tag index that follows the record', async () => {
+    const tagged = async (tag: string) => (await get(`/v1/cards?tag=${tag}`)).json().cards.map((x: CardBundle) => x.card.aceId);
+    const a = await published(relay, { listed: true });
+    const b = await published(relay, { listed: true });
+    expect((await publishCard(relay, a, { listed: true, card: { tags: ['tg-red', 'tg-blue'] }, now: now() + 1 })).statusCode).toBe(200);
+    expect((await publishCard(relay, b, { listed: true, card: { tags: ['tg-red'] }, now: now() + 1 })).statusCode).toBe(200);
+    expect(await tagged('tg-red')).toEqual([a.aceId, b.aceId].sort());
+    expect(await tagged('tg-blue')).toEqual([a.aceId]);
+    expect(await tagged('tg-none')).toEqual([]);
+    expect((await get(`/v1/cards?tag=tg-red&profile=ace:commerce:1`)).json().cards).toEqual([]);
+    // A tag change moves the entries; unlisting, a move to another home and unregister remove them.
+    expect((await publishCard(relay, a, { listed: true, card: { tags: ['tg-blue', 'tg-green'] }, now: now() + 2 })).statusCode).toBe(200);
+    expect(await tagged('tg-red')).toEqual([b.aceId]);
+    expect(await tagged('tg-green')).toEqual([a.aceId]);
+    expect((await publishCard(relay, a, { listed: false, card: { tags: ['tg-blue', 'tg-green'] }, now: now() + 3 })).statusCode).toBe(200);
+    expect(await tagged('tg-blue')).toEqual([]);
+    expect(await relay.redis.exists('ace:directory-tag:tg-blue')).toBe(0);
+    expect((await publishCard(relay, a, { listed: true, card: { tags: ['tg-blue'] }, now: now() + 4 })).statusCode).toBe(200);
+    expect(await tagged('tg-blue')).toEqual([a.aceId]);
+    expect((await publishCard(relay, a, { home: OTHER_HOME, listed: true, card: { tags: ['tg-blue'] }, now: now() + 5 })).statusCode).toBe(200);
+    expect(await tagged('tg-blue')).toEqual([]);
+    expect((await unregister(relay, b, now() + 2)).statusCode).toBe(200);
+    expect(await tagged('tg-red')).toEqual([]);
+    expect(await relay.redis.exists('ace:directory-tag:tg-red')).toBe(0);
+    // A record under a superseded KEL is absent from tag results too.
+    const c = await published(relay, { listed: true });
+    expect((await publishCard(relay, c, { listed: true, card: { tags: ['tg-rot'] }, now: now() + 1 })).statusCode).toBe(200);
+    expect(await tagged('tg-rot')).toEqual([c.aceId]);
+    await c.id.delegate();
+    expect((await register(relay, c, now() + 2)).json().status).toBe('rotated');
+    expect(await tagged('tg-rot')).toEqual([]);
+    // Leave the directory to the directory test.
+    await unregister(relay, c, now() + 3);
+    await publishCard(relay, a, { home: OTHER_HOME, now: now() + 6 });
+  });
+
+  it('tag index bytes are charged with the record and released at unregister', async () => {
+    const a = await newAgent();
+    expect((await relay.app.inject({
+      method: 'POST', url: '/v1/register', remoteAddress: '192.0.2.41',
+      payload: await createRegistrationRequest(a.id, { audience: RELAY_URL }),
+    })).statusCode).toBe(200);
+    expect((await publish(relay, a)).statusCode).toBe(200);
+    const net = 'n:192.0.2.0/24';
+    const before = await relay.messageStore.registrationNetworkBytes(net);
+    const bundle = await cardOf(a, { listed: true, card: { tags: ['tb-one', 'tb-three'] } });
+    expect((await postCard(relay, bundle)).statusCode).toBe(200);
+    const index = 2 * a.aceId.length + 'tb-one'.length + 'tb-three'.length;
+    expect((await relay.messageStore.registrationNetworkBytes(net)) - before).toBe(Buffer.byteLength(JSON.stringify(bundle)) + index);
+    // Unlisted, the record keeps no index entries and is charged its json alone.
+    const unlisted = await cardOf(a, { listed: false, card: { tags: ['tb-one', 'tb-three'] }, now: now() + 1 });
+    expect((await postCard(relay, unlisted)).statusCode).toBe(200);
+    expect((await relay.messageStore.registrationNetworkBytes(net)) - before).toBe(Buffer.byteLength(JSON.stringify(unlisted)));
+    const last = await cardOf(a, { listed: true, card: { tags: ['tb-one'] }, now: now() + 2 });
+    expect((await postCard(relay, last)).statusCode).toBe(200);
+    const cardBytes = Buffer.byteLength(JSON.stringify(last)) + a.aceId.length + 'tb-one'.length;
+    expect(Number(await relay.redis.hget(`ace:card:${a.aceId}`, 'jb'))).toBe(cardBytes);
+    const descriptorBytes = Number(await relay.redis.hget(`ace:descriptor:${a.aceId}`, 'jb'));
+    const held = await relay.messageStore.registrationNetworkBytes(net);
+    expect((await unregister(relay, a, now() + 3)).statusCode).toBe(200);
+    expect(await relay.redis.exists('ace:directory-tag:tb-one')).toBe(0);
+    expect(held - (await relay.messageStore.registrationNetworkBytes(net))).toBe(descriptorBytes + cardBytes - HORIZON_BYTES);
   });
 });
 
