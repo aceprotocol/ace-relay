@@ -53,9 +53,9 @@ env:
   # is a reviewed relay commit; the two must be a coherent set (the relay tests replay
   # ace-spec's test-vectors.json).
   SDK_TS_REPO: aceprotocol/ace-sdk-ts
-  SDK_TS_SHA: d107618fb82cda8f59195bbde3b165daacd5ab98
+  SDK_TS_SHA: 65e0b4f72d42bba1e67a9a8961144088efc1e012
   ACE_SPEC_REPO: aceprotocol/ace-spec
-  ACE_SPEC_SHA: eb4ae252bac42a2e91d3d50f04bfde54b5fbee24
+  ACE_SPEC_SHA: d5902bab205623bad4ad1c0b285d0ff8f23968a6
 
 jobs:
   # Gate the image build on the test suite. The suites talk to a real Redis at

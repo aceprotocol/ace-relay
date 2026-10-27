@@ -1,6 +1,6 @@
 // 07 § Descriptors and cards: card records, set-once handles, the listed directory and the open-contact send rule.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { MAX_INBOX_PAGE, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
+import { MAX_INBOX_PAGE, createCardRecord, createRegistrationRequest, documentDigest, type CardBundle } from '@ace-protocol/sdk';
 import { HORIZON_BYTES } from '../src/store/identity.js';
 import {
   BAD_RELAY_URLS, RELAY_URL, cardOf, createTestRelay, newAgent, now, packet, postCard, publish, publishCard, published, register,
@@ -27,6 +27,14 @@ describe('POST /v1/card', () => {
     expect(res.json()).toEqual(bundle);
     expect((await get(`/v1/card/${(await newAgent()).aceId}`)).json().error).toBe('unknown_peer');
     expect((await get('/v1/card/not-an-id')).json().error).toBe('unknown_peer');
+  });
+
+  it('publishes and serves a card with erc8004 bindings', async () => {
+    const a = await registered(relay);
+    const erc8004 = [{ agentRegistry: 'eip155:1:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432', agentId: '42' }];
+    const bundle = await createCardRecord(a.id, { home: RELAY_URL, contact: 'closed', listed: false, erc8004 });
+    expect((await postCard(relay, bundle)).json()).toEqual({ ok: true });
+    expect((await get(`/v1/card/${a.aceId}`)).json().card.erc8004).toEqual(erc8004);
   });
 
   it('requires registration, the registered KEL and a valid record', async () => {
@@ -497,5 +505,17 @@ describe('send without a permit', () => {
     await publish(relay, openNoDescriptor);
     await relay.redis.hset(`ace:descriptor:${openNoDescriptor.aceId}`, 'expiresAt', String(now() - 1));
     expect((await send(relay, await packet(from, openNoDescriptor))).json().error).toBe('not_permitted');
+  });
+});
+
+// Last in the file: it lists more agents than one page, which the tests above do not expect.
+describe('directory default page', () => {
+  it('returns MAX_INBOX_PAGE (100) cards and a cursor when no limit is given', async () => {
+    expect(MAX_INBOX_PAGE).toBe(100);
+    for (let i = 0; i < MAX_INBOX_PAGE + 1; i++) await published(relay, { listed: true, contact: 'closed' });
+    const page = (await get('/v1/cards')).json();
+    expect(page.cards).toHaveLength(100);
+    expect(page.cursor).toBe(page.cards[99].card.aceId);
+    expect((await get(`/v1/cards?cursor=${page.cursor}`)).json().cards.length).toBeGreaterThanOrEqual(1);
   });
 });

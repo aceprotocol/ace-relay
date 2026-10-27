@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  RelayClient, SoftwareIdentity, SoftwareKey, createDescriptor, encodePayload, fromBase64, signingMessage, toBase64, verifyKel,
+  BUNDLED_MANIFESTS, DELEGATION_PROFILE_ID, MAX_EXT_BYTES, RelayClient, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegationCredential, createDescriptor, encodePayload, profileDigest, fromBase64, signingMessage, toBase64, verifyKel,
   type JSONObject, type KelEvent, type PublishedAgent, type SoftwareIdentityExport,
 } from '@ace-protocol/sdk';
 import {
@@ -158,6 +158,39 @@ describe('POST /v1/descriptor', () => {
     const res = await post({ kel: d.kel, descriptor: await resign(a, 'agent-descriptor', { ...d.descriptor, relays: [RELAY_URL, bad] }) });
     expect(res.statusCode).toBe(401);
     expect(res.json().error).toBe('invalid_authorization');
+  });
+});
+
+describe('ext (04 § Extensions)', () => {
+  const pubWith = async (a: Agent, ext: JSONObject, profiles: { id: string; digest: string }[]) => {
+    const pk = (await a.vault.current())!;
+    return createDescriptor(a.id, { relays: [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles, ext });
+  };
+
+  it('accepts ext of exactly MAX_EXT_BYTES and refuses one byte more', async () => {
+    expect(MAX_EXT_BYTES).toBe(32768);
+    const a = await registered(relay);
+    const profiles = [{ id: 'x:big:1', digest: 'a'.repeat(64) }];
+    const sized = (n: number): JSONObject => {
+      const base = canonicalStateBytes({ 'x:big:1': { v: '' } }).length;
+      return { 'x:big:1': { v: 'x'.repeat(n - base) } };
+    };
+    const ok = await pubWith(a, sized(MAX_EXT_BYTES), profiles);
+    expect(canonicalStateBytes(ok.descriptor.ext!).length).toBe(MAX_EXT_BYTES);
+    const over: PublishedAgent = structuredClone(ok);
+    over.descriptor.ext = sized(MAX_EXT_BYTES + 1);
+    expect((await post(over)).statusCode).toBe(401);
+    expect((await post(ok)).statusCode).toBe(200);
+  });
+
+  it('publishes a descriptor carrying four delegation credentials', async () => {
+    const a = await registered(relay);
+    const issuers = await Promise.all([1, 2, 3, 4].map(() => newAgent()));
+    const credentials = await Promise.all(issuers.map((i) => createDelegationCredential(i.id, a.aceId)));
+    const d = await pubWith(a, { [DELEGATION_PROFILE_ID]: { credentials } as unknown as JSONObject },
+      [{ id: DELEGATION_PROFILE_ID, digest: profileDigest(BUNDLED_MANIFESTS.delegation) }]);
+    expect((await post(d)).statusCode).toBe(200);
+    expect((await get(`/v1/descriptor/${a.aceId}`)).json().descriptor.ext[DELEGATION_PROFILE_ID].credentials).toHaveLength(4);
   });
 });
 

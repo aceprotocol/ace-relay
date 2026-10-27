@@ -76,7 +76,7 @@ published under: after any KEL change (`dlg`, `rot`, recovery) it is treated as 
 republish their card record after every KEL change** (the SDK's upkeep does this).
 
 **Directory.** `GET /v1/cards` serves the stored CardBundles of identities whose current record names this relay as
-`home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most `limit` (1..100, default 20)
+`home` and is `listed: true`, with an unexpired descriptor: ordered by ACE ID, at most `limit` (1..100, default 100)
 entries and 8 MiB per page (at least one entry when any remain), scanning at most 1000 entries; continue until
 `cursor: null`. `tag` (`^[a-z0-9-]{1,32}$`, else `400 invalid_argument`) keeps the records listing that tag and reads
 a per-tag index (`ace:directory-tag:<tag>`) the card script keeps beside the directory set, so a tag query scans only

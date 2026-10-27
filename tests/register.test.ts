@@ -28,7 +28,7 @@ describe('POST /v1/register', () => {
   });
 
   it('rejects malformed, stale and mismatched requests', async () => {
-    const a = await newAgent();
+    const a = await newAgent(1000);
     const req = await createRegistrationRequest(a.id, { audience: RELAY_URL });
     const post = (payload: unknown) => relay.app.inject({ method: 'POST', url: '/v1/register', payload: payload as object });
     expect((await post({ ...req, extra: 1 })).json().error).toBe('invalid_registration');
@@ -122,7 +122,7 @@ describe('POST /v1/unregister', () => {
 
 describe('authentication', () => {
   it('checks registration, seq, audience, freshness and nonces', async () => {
-    const a = await registered(relay);
+    const a = await registered(relay, 1000);
     const stranger = await newAgent();
     const get = (headers: Record<string, string>) => relay.app.inject({ method: 'GET', url: '/v1/inbox?limit=100', headers });
     const req = { action: 'inbox' as const, since: '-', limit: 100 };

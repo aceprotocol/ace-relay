@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
-  DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_PUBLISHED_AGENT_BYTES, documentDigest, isACEId, isHandle, verifyCardBundle, verifyPublishedAgent,
+  MAX_INBOX_PAGE, MAX_PUBLISHED_AGENT_BYTES, documentDigest, isACEId, isHandle, verifyCardBundle, verifyPublishedAgent,
 } from '@ace-protocol/sdk';
 import type { DescriptorStore } from '../store/descriptors.js';
 import type { CardStore } from '../store/cards.js';
@@ -103,7 +103,7 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     await enforceRate(rateLimiter, `directory:${clientOf(req)}`, config.discoverRateLimit, 60, 'network');
     const q = req.query as { tag?: string; profile?: string; cursor?: string; limit?: number };
     if (q.cursor !== undefined && !isACEId(q.cursor)) throw new RelayError('invalid_argument', 'invalid cursor');
-    return cards.directory({ cursor: q.cursor, limit: q.limit ?? DEFAULT_PAGE_LIMIT, tag: q.tag, profile: q.profile, now: clock() });
+    return cards.directory({ cursor: q.cursor, limit: q.limit ?? MAX_INBOX_PAGE, tag: q.tag, profile: q.profile, now: clock() });
   });
 
   app.post('/v1/blocks', { schema: blockSchema }, async (req: FastifyRequest) => {

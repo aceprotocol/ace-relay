@@ -93,8 +93,9 @@ export interface Agent {
   vault: PrekeyVault;
 }
 
-export async function newAgent(): Promise<Agent> {
-  const id = await SoftwareIdentity.generate();
+/** `age`: seconds the log's events are back-dated (signing never precedes the log's last event, 01 rule 3). */
+export async function newAgent(age = 0): Promise<Agent> {
+  const id = await SoftwareIdentity.generate({ now: now() - age });
   const vault = new StorePrekeyVault(new MemoryStore());
   await vault.rotate(now());
   return { id, aceId: id.getACEId(), vault };
@@ -108,8 +109,8 @@ export async function unregister(relay: TestRelay, agent: Agent, timestamp = now
   return relay.app.inject({ method: 'POST', url: '/v1/unregister', headers: await authHeaders(agent, { action: 'unregister' }, timestamp) });
 }
 
-export async function registered(relay: TestRelay): Promise<Agent> {
-  const a = await newAgent();
+export async function registered(relay: TestRelay, age = 0): Promise<Agent> {
+  const a = await newAgent(age);
   const res = await register(relay, a);
   if (res.statusCode !== 200) throw new Error(`register failed: ${res.body}`);
   return a;
