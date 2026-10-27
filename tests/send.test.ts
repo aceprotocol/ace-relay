@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, createRegistrationRequest } from '@ace-protocol/sdk';
+import { MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, createRegistrationRequest } from '@ace-protocol/sdk';
 import {
-  ack, authHeaders, block, createTestRelay, inbox, newAgent, now, packet, permit, published, registered, send, type TestRelay,
+  BACKDATED, ack, authHeaders, block, createTestRelay, inbox, newAgent, now, packet, permit, published, registered, send, type TestRelay,
   RELAY_URL,
 } from './helpers.js';
 import { HORIZON_BYTES } from '../src/store/identity.js';
@@ -22,7 +22,7 @@ describe('POST /v1/send with a permit', () => {
   });
 
   it('refuses permits that do not admit this sender', async () => {
-    const to = await published(relay, { age: 1000 /* seconds: so the expired permit below is not clamped up */ }), from = await newAgent(), other = await registered(relay);
+    const to = await published(relay, { age: BACKDATED }), from = await newAgent(), other = await registered(relay);
     const p = await packet(from, to);
     const notPermitted = async (permitValue: unknown) => {
       const res = await send(relay, p, permitValue);
@@ -121,7 +121,7 @@ describe('POST /v1/send without a permit (stranger allowance)', () => {
 
 describe('POST /v1/send validation', () => {
   it('rejects malformed bodies and packets, unknown recipients (as not_permitted) and timestamps outside the window', async () => {
-    const to = await published(relay, { contact: 'open' }), from = await newAgent(604_900 /* seconds: older than the offline window */);
+    const to = await published(relay, { contact: 'open' }), from = await newAgent(OFFLINE_WINDOW_SECONDS + 100);
     const p = await packet(from, to);
     expect((await send(relay, { ...p, ace: '2' })).json().error).toBe('unsupported_version');
     expect((await send(relay, { ...p, extra: 1 })).json().error).toBe('invalid_packet');

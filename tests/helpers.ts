@@ -14,8 +14,8 @@ import Redis from 'ioredis';
 import { vi } from 'vitest';
 import {
   MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, canonicalStateBytes, createAuthHeaders, createCardRecord, createDescriptor,
-  createPacket, createPermit, createRegistrationRequest, prekeyPublicKey, signingMessage, toBase64, verifyKel, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
-  type PrekeyVault, type PublishedAgent, type RelayAuthRequest,
+  createPacket, createPermit, createRegistrationRequest, signingMessage, toBase64, verifyKel, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
+  type JSONObject, type PrekeyVault, type PublishedAgent, type RelayAuthRequest,
 } from '@ace-protocol/sdk';
 import { buildApp, type RelayApp } from '../src/app.js';
 import { parseCidrs, validateConfig, type RelayConfig } from '../src/config.js';
@@ -94,6 +94,9 @@ export interface Agent {
 }
 
 /** `age`: seconds the log's events are back-dated (signing never precedes the log's last event, 01 rule 3). */
+/** An `age` that lets a test sign a few hundred seconds in the past without the timestamp being clamped up. */
+export const BACKDATED = 1000;
+
 export async function newAgent(age = 0): Promise<Agent> {
   const id = await SoftwareIdentity.generate({ now: now() - age });
   const vault = new StorePrekeyVault(new MemoryStore());
@@ -116,10 +119,13 @@ export async function registered(relay: TestRelay, age = 0): Promise<Agent> {
   return a;
 }
 
-export async function descriptorOf(agent: Agent, o: { relays?: string[]; now?: number; ttl?: number } = {}): Promise<PublishedAgent> {
+export async function descriptorOf(
+  agent: Agent, o: { relays?: string[]; now?: number; ttl?: number; profiles?: { id: string; digest: string }[]; ext?: JSONObject } = {},
+): Promise<PublishedAgent> {
   const pk = (await agent.vault.current())!;
   return createDescriptor(agent.id, {
-    relays: o.relays ?? [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: text.descriptors(), now: o.now, ttl: o.ttl,
+    relays: o.relays ?? [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: o.profiles ?? text.descriptors(), ext: o.ext,
+    now: o.now, ttl: o.ttl,
   });
 }
 
@@ -155,13 +161,15 @@ export function postCard(relay: TestRelay, bundle: unknown, remoteAddress?: stri
   return relay.app.inject({ method: 'POST', url: '/v1/card', payload: bundle as object, ...(remoteAddress ? { remoteAddress } : {}) });
 }
 
-/** Registered and published; with any card option (contact, listed, handle) also a card record. */
-export async function published(relay: TestRelay, o: Parameters<typeof descriptorOf>[1] & Pick<CardOptions, 'contact' | 'listed' | 'handle'> & { age?: number } = {}): Promise<Agent> {
+export type PublishedOptions = Parameters<typeof descriptorOf>[1] & Pick<CardOptions, 'contact' | 'listed' | 'handle' | 'card'> & { age?: number };
+
+/** Registered and published; with any card option (contact, listed, handle, card) also a card record. */
+export async function published(relay: TestRelay, o: PublishedOptions = {}): Promise<Agent> {
   const a = await registered(relay, o.age);
   const res = await publish(relay, a, o);
   if (res.statusCode !== 200) throw new Error(`publish failed: ${res.body}`);
-  if (o.contact !== undefined || o.listed !== undefined || o.handle !== undefined) {
-    const c = await publishCard(relay, a, { contact: o.contact, listed: o.listed, handle: o.handle, now: o.now });
+  if (o.contact !== undefined || o.listed !== undefined || o.handle !== undefined || o.card !== undefined) {
+    const c = await publishCard(relay, a, { contact: o.contact, listed: o.listed, handle: o.handle, card: o.card, now: o.now });
     if (c.statusCode !== 200) throw new Error(`card failed: ${c.body}`);
   }
   return a;
@@ -173,14 +181,13 @@ export async function authHeaders(agent: Agent, req: RelayAuthRequest, timestamp
   return Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
 }
 
-/** A peer prekey for private content: the Base64 X-Wing public key of a random seed (04 § Peer prekeys). */
-export const somePrekey = (): string => toBase64(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32))));
-
 export async function packet(from: Agent, to: Agent, o: { message?: string; timestamp?: number; messageId?: string } = {}): Promise<Packet> {
   const pk = (await to.vault.current())!;
+  // Private content carries the sender's peer prekey for `to` (04 § Peer prekeys), as the SDK's send path offers it.
+  const offered = await from.vault.offer(to.aceId, o.timestamp ?? now());
   return createPacket({
     identity: from.id, to: to.aceId, prekey: { id: pk.id, publicKey: pk.publicKey }, timestamp: o.timestamp, messageId: o.messageId,
-    content: { type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: o.message ?? 'hello' }, prekey: somePrekey() },
+    content: { type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: o.message ?? 'hello' }, prekey: offered.publicKey },
   });
 }
 

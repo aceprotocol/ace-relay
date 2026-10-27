@@ -508,14 +508,15 @@ describe('send without a permit', () => {
   });
 });
 
-// Last in the file: it lists more agents than one page, which the tests above do not expect.
 describe('directory default page', () => {
-  it('returns MAX_INBOX_PAGE (100) cards and a cursor when no limit is given', async () => {
+  it('returns MAX_INBOX_PAGE cards and a cursor when no limit is given', async () => {
     expect(MAX_INBOX_PAGE).toBe(100);
-    for (let i = 0; i < MAX_INBOX_PAGE + 1; i++) await published(relay, { listed: true, contact: 'closed' });
-    const page = (await get('/v1/cards')).json();
-    expect(page.cards).toHaveLength(100);
-    expect(page.cursor).toBe(page.cards[99].card.aceId);
-    expect((await get(`/v1/cards?cursor=${page.cursor}`)).json().cards.length).toBeGreaterThanOrEqual(1);
+    // A tag of its own keeps this page apart from every other listed agent in the suite.
+    const card = { tags: ['default-page'] };
+    await Promise.all(Array.from({ length: MAX_INBOX_PAGE + 1 }, () => published(relay, { listed: true, contact: 'closed', card })));
+    const page = (await get('/v1/cards?tag=default-page')).json();
+    expect(page.cards).toHaveLength(MAX_INBOX_PAGE);
+    expect(page.cursor).toBe(page.cards.at(-1).card.aceId);
+    expect((await get(`/v1/cards?tag=default-page&cursor=${page.cursor}`)).json().cards).toHaveLength(1);
   });
 });

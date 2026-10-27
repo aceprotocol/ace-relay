@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  BUNDLED_MANIFESTS, DELEGATION_PROFILE_ID, MAX_EXT_BYTES, RelayClient, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegationCredential, createDescriptor, encodePayload, profileDigest, fromBase64, signingMessage, toBase64, verifyKel,
+  BUNDLED_MANIFESTS, DELEGATION_PROFILE_ID, MAX_EXT_BYTES, RelayClient, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegationCredential, encodePayload, profileDigest, fromBase64, signingMessage, toBase64, verifyKel,
   type JSONObject, type KelEvent, type PublishedAgent, type SoftwareIdentityExport,
 } from '@ace-protocol/sdk';
 import {
@@ -162,26 +162,19 @@ describe('POST /v1/descriptor', () => {
 });
 
 describe('ext (04 § Extensions)', () => {
-  const pubWith = async (a: Agent, ext: JSONObject, profiles: { id: string; digest: string }[]) => {
-    const pk = (await a.vault.current())!;
-    return createDescriptor(a.id, { relays: [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles, ext });
-  };
-
   it('accepts ext of exactly MAX_EXT_BYTES and refuses one byte more', async () => {
     expect(MAX_EXT_BYTES).toBe(32768);
     const a = await registered(relay);
-    const profiles = [{ id: 'x:big:1', digest: 'a'.repeat(64) }];
-    const sized = (n: number): JSONObject => {
-      const base = canonicalStateBytes({ 'x:big:1': { v: '' } }).length;
-      return { 'x:big:1': { v: 'x'.repeat(n - base) } };
-    };
-    const ok = await pubWith(a, sized(MAX_EXT_BYTES), profiles);
+    const id = 'x:big:1';
+    const base = canonicalStateBytes({ [id]: { v: '' } }).length;
+    const sized = (n: number): JSONObject => ({ [id]: { v: 'x'.repeat(n - base) } });
+    const ok = await descriptorOf(a, { profiles: [{ id, digest: 'a'.repeat(64) }], ext: sized(MAX_EXT_BYTES) });
     expect(canonicalStateBytes(ok.descriptor.ext!).length).toBe(MAX_EXT_BYTES);
     // Validly signed (the SDK would refuse to create it), so only the size limit can refuse it.
     const over: PublishedAgent = { kel: ok.kel, descriptor: await resign(a, 'agent-descriptor', { ...ok.descriptor, ext: sized(MAX_EXT_BYTES + 1) }) };
     const refused = await post(over);
     expect(refused.statusCode).toBe(401);
-    expect(refused.json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringMatching(/ext exceeds 32768 bytes/) });
+    expect(refused.json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringContaining(`ext exceeds ${MAX_EXT_BYTES} bytes`) });
     expect((await post(ok)).statusCode).toBe(200);
   });
 
@@ -189,8 +182,10 @@ describe('ext (04 § Extensions)', () => {
     const a = await registered(relay);
     const issuers = await Promise.all([1, 2, 3, 4].map(() => newAgent()));
     const credentials = await Promise.all(issuers.map((i) => createDelegationCredential(i.id, a.aceId)));
-    const d = await pubWith(a, { [DELEGATION_PROFILE_ID]: { credentials } as unknown as JSONObject },
-      [{ id: DELEGATION_PROFILE_ID, digest: profileDigest(BUNDLED_MANIFESTS.delegation) }]);
+    const d = await descriptorOf(a, {
+      profiles: [{ id: DELEGATION_PROFILE_ID, digest: profileDigest(BUNDLED_MANIFESTS.delegation) }],
+      ext: { [DELEGATION_PROFILE_ID]: { credentials } as unknown as JSONObject },
+    });
     expect((await post(d)).statusCode).toBe(200);
     expect((await get(`/v1/descriptor/${a.aceId}`)).json().descriptor.ext[DELEGATION_PROFILE_ID].credentials).toHaveLength(4);
   });
@@ -203,12 +198,8 @@ describe('depth (02 § JSON values)', () => {
 
   it('accepts a PublishedAgent at exactly MAX_JSON_DEPTH, refuses one level more, and serves the boundary agent in a page clients accept', async () => {
     const a = await registered(relay);
-    const pk = (await a.vault.current())!;
     // ext (depth 2) → x:deep:1 (3) → 29 more levels: depth 32
-    const ok = await createDescriptor(a.id, {
-      relays: [RELAY_URL], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: [{ id: 'x:deep:1', digest: 'a'.repeat(64) }],
-      ext: { 'x:deep:1': nest(29) },
-    });
+    const ok = await descriptorOf(a, { profiles: [{ id: 'x:deep:1', digest: 'a'.repeat(64) }], ext: { 'x:deep:1': nest(29) } });
     const over: PublishedAgent = structuredClone(ok);
     over.descriptor.ext = { 'x:deep:1': nest(30) };
     const refused = await post(over);
