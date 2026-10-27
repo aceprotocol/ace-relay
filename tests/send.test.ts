@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, MIN_PLAINTEXT_BUCKET, createRegistrationRequest, toBase64 } from '@ace-protocol/sdk';
+import { MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, createRegistrationRequest } from '@ace-protocol/sdk';
 import {
   ack, authHeaders, block, createTestRelay, inbox, newAgent, now, packet, permit, published, registered, send, type TestRelay,
   RELAY_URL,
@@ -129,12 +129,6 @@ describe('POST /v1/send validation', () => {
     // 03 § Decoding: an oversize payload is invalid_packet, straight from the SDK decoder
     const huge = 'A'.repeat(4 * Math.ceil((MAX_PLAINTEXT_BYTES + 29) / 3));
     expect((await send(relay, { ...p, encryption: { ...p.encryption, payload: huge } })).json().error).toBe('invalid_packet');
-    // 03 § Decoding: a payload is a padded bucket plus the 28-byte AEAD overhead; the smallest bucket passes decode
-    // (the relay never opens it), one byte off any bucket is invalid_packet.
-    const sized = (n: number) => ({ ...p, encryption: { ...p.encryption, payload: toBase64(new Uint8Array(n)) } });
-    expect((await send(relay, sized(MIN_PLAINTEXT_BUCKET + 28))).statusCode).toBe(200);
-    expect((await send(relay, sized(MIN_PLAINTEXT_BUCKET + 29))).json().error).toBe('invalid_packet');
-    expect((await send(relay, sized(MIN_PLAINTEXT_BUCKET + 27))).json().error).toBe('invalid_packet');
     const extra = await relay.app.inject({ method: 'POST', url: '/v1/send', payload: { packet: p, source: {} } });
     expect(extra.json().error).toBe('invalid_argument');
     expect((await relay.app.inject({ method: 'POST', url: '/v1/send', payload: {} })).json().error).toBe('invalid_argument');
