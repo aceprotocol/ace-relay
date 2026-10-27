@@ -14,7 +14,7 @@ import Redis from 'ioredis';
 import { vi } from 'vitest';
 import {
   MemoryStore, ProfileSet, StorePrekeyVault, SoftwareIdentity, canonicalStateBytes, createAuthHeaders, createCardRecord, createDescriptor,
-  createPacket, createPermit, createRegistrationRequest, signingMessage, toBase64, verifyKel, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
+  createPacket, createPermit, createRegistrationRequest, prekeyPublicKey, signingMessage, toBase64, verifyKel, type AgentCard, type CardBundle, type Contact, type DeliveryPermit, type Packet,
   type PrekeyVault, type PublishedAgent, type RelayAuthRequest,
 } from '@ace-protocol/sdk';
 import { buildApp, type RelayApp } from '../src/app.js';
@@ -172,11 +172,14 @@ export async function authHeaders(agent: Agent, req: RelayAuthRequest, timestamp
   return Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
 }
 
+/** A peer prekey for private content: the Base64 X-Wing public key of a random seed (04 § Peer prekeys). */
+export const somePrekey = (): string => toBase64(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32))));
+
 export async function packet(from: Agent, to: Agent, o: { message?: string; timestamp?: number; messageId?: string } = {}): Promise<Packet> {
   const pk = (await to.vault.current())!;
   return createPacket({
     identity: from.id, to: to.aceId, prekey: { id: pk.id, publicKey: pk.publicKey }, timestamp: o.timestamp, messageId: o.messageId,
-    content: { type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: o.message ?? 'hello' } },
+    content: { type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: o.message ?? 'hello' }, prekey: somePrekey() },
   });
 }
 
