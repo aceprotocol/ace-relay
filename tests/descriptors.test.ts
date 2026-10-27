@@ -177,9 +177,11 @@ describe('ext (04 § Extensions)', () => {
     };
     const ok = await pubWith(a, sized(MAX_EXT_BYTES), profiles);
     expect(canonicalStateBytes(ok.descriptor.ext!).length).toBe(MAX_EXT_BYTES);
-    const over: PublishedAgent = structuredClone(ok);
-    over.descriptor.ext = sized(MAX_EXT_BYTES + 1);
-    expect((await post(over)).statusCode).toBe(401);
+    // Validly signed (the SDK would refuse to create it), so only the size limit can refuse it.
+    const over: PublishedAgent = { kel: ok.kel, descriptor: await resign(a, 'agent-descriptor', { ...ok.descriptor, ext: sized(MAX_EXT_BYTES + 1) }) };
+    const refused = await post(over);
+    expect(refused.statusCode).toBe(401);
+    expect(refused.json()).toMatchObject({ error: 'invalid_authorization', message: expect.stringMatching(/ext exceeds 32768 bytes/) });
     expect((await post(ok)).statusCode).toBe(200);
   });
 

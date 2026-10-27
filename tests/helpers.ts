@@ -156,8 +156,8 @@ export function postCard(relay: TestRelay, bundle: unknown, remoteAddress?: stri
 }
 
 /** Registered and published; with any card option (contact, listed, handle) also a card record. */
-export async function published(relay: TestRelay, o: Parameters<typeof descriptorOf>[1] & Pick<CardOptions, 'contact' | 'listed' | 'handle'> = {}): Promise<Agent> {
-  const a = await registered(relay);
+export async function published(relay: TestRelay, o: Parameters<typeof descriptorOf>[1] & Pick<CardOptions, 'contact' | 'listed' | 'handle'> & { age?: number } = {}): Promise<Agent> {
+  const a = await registered(relay, o.age);
   const res = await publish(relay, a, o);
   if (res.statusCode !== 200) throw new Error(`publish failed: ${res.body}`);
   if (o.contact !== undefined || o.listed !== undefined || o.handle !== undefined) {
