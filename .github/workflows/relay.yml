@@ -53,7 +53,7 @@ env:
   # is a reviewed relay commit; the two must be a coherent set (the relay tests replay
   # ace-spec's test-vectors.json).
   SDK_TS_REPO: aceprotocol/ace-sdk-ts
-  SDK_TS_SHA: 3f032e30db218e24229e2e09c42eb2f34ae1a51a
+  SDK_TS_SHA: c5c4208d6f19149b345dfec33547a37517fa31c2
   ACE_SPEC_REPO: aceprotocol/ace-spec
   ACE_SPEC_SHA: 06941dc2c135cbdb85125e64389cad8c114387c1
 
