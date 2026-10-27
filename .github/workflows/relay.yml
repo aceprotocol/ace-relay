@@ -55,7 +55,7 @@ env:
   SDK_TS_REPO: aceprotocol/ace-sdk-ts
   SDK_TS_SHA: 65e0b4f72d42bba1e67a9a8961144088efc1e012
   ACE_SPEC_REPO: aceprotocol/ace-spec
-  ACE_SPEC_SHA: d5902bab205623bad4ad1c0b285d0ff8f23968a6
+  ACE_SPEC_SHA: ec6a7c4a9acaa69490caa1c7098e3ccca6dac6a1
 
 jobs:
   # Gate the image build on the test suite. The suites talk to a real Redis at
