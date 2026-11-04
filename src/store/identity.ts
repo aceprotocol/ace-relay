@@ -1,0 +1,282 @@
+import type Redis from 'ioredis';
+import { OFFLINE_WINDOW_SECONDS, isACEId, type KelEvent } from '@ace-protocol/sdk';
+import { RelayError } from '../errors.js';
+import {
+  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, DIRECTORY_TAG_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
+  queueKeys,
+} from './keyspace.js';
+import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, RUNS_WHEN_FULL, budgetArgs, type ByteBudget } from './lua.js';
+
+/**
+ * Identity-only registration state: the current signing delegation derived from the verified KEL, written with it in
+ * one script, so authenticating a request or a permit never reads the log. Public metadata lives in signed descriptors.
+ */
+export interface StoredIdentity {
+  aceId: string;
+  seq: number; // the log's current signing delegation (X-ACE-Seq / signature.seq must equal it)
+  lastHash: string; // hex SHA-256 of the log's last event; `rotated` = it changed
+  signingPublicKey: string; // canonical Base64 of the delegated ml-dsa-65 key
+  delegatedAt: number; // ts of the delegating dlg event
+  notAfter: number | null; // the delegation's notAfter
+  registeredAt: number; // the verified request timestamp
+  requestDigest: string;
+  retiredAt?: number;
+}
+
+/** A stored identity with its verified log (registration and unregister only). */
+export interface StoredHistory extends StoredIdentity {
+  kel: KelEvent[];
+}
+
+const IDENTITY_FIELDS = ['seq', 'lastHash', 'signingPublicKey', 'delegatedAt', 'notAfter', 'registeredAt', 'requestDigest', 'retiredAt'] as const;
+
+/**
+ * The permanent anti-rollback record of an unregistered identity, kept after its KEL expired (fixed size): the
+ * registration barrier, the seq and hash of the KEL's last root-epoch event (its last `icp` or `rot`) and of its last
+ * event. A registration is checked against it in the register route; the descriptor and card record horizons are
+ * restored on re-registration.
+ */
+export interface Horizon {
+  retiredAt: number;
+  epochSeq: number;
+  epochStartHash: string;
+  lastSeq: number;
+  lastHash: string;
+}
+
+/** Bytes a horizon is charged permanently to its registration network: an upper bound of its stored size. */
+export const HORIZON_BYTES = 512;
+
+/** `IDENTITY_KEY_PREFIX + aceId`, only for a valid ACE ID (never a glob, never another key). */
+function identityKey(aceId: string): string {
+  if (!isACEId(aceId)) throw new RelayError('invalid_argument', 'aceId must be an ACE ID');
+  return IDENTITY_KEY_PREFIX + aceId;
+}
+
+export interface StoreLogger {
+  error(obj: object, msg: string): void;
+}
+
+export const consoleLogger: StoreLogger = {
+  error: (obj, msg) => console.error(msg, obj),
+};
+
+/** An identity hash as register() wrote it; absent `signingPublicKey` means not registered. */
+function parseIdentityHash(aceId: string, d: Partial<Record<(typeof IDENTITY_FIELDS)[number], string>>): StoredIdentity | null {
+  if (d.signingPublicKey === undefined) return null;
+  return {
+    aceId,
+    seq: Number(d.seq),
+    lastHash: d.lastHash!,
+    signingPublicKey: d.signingPublicKey,
+    delegatedAt: Number(d.delegatedAt),
+    notAfter: d.notAfter ? Number(d.notAfter) : null,
+    registeredAt: Number(d.registeredAt),
+    requestDigest: d.requestDigest!,
+    ...(d.retiredAt === undefined ? {} : { retiredAt: Number(d.retiredAt) }),
+  };
+}
+
+// KEYS: identity, descriptor, horizon, card. ARGV: kel, seq, lastHash, signingPublicKey, timestamp, requestDigest,
+// expected lastHash, expected requestDigest, network, the ByteBudget (10..14), delegatedAt, notAfter ('' = none). The KEL's bytes (and a stored descriptor's
+// and card record's) are charged to the network registered from; a registration over its budget (`rate_limited`), or
+// one that grows the store at the high-water mark (`relay_busy`), is refused. A retired identity's KEL charge lapses
+// with the packet window (see unregister), so a re-registration charges it afresh.
+const REGISTER_IDENTITY_SCRIPT = MAY_GROW + BYTES_LUA + CAPACITY_LUA + `
+local timestamp = tonumber(ARGV[5])
+local retiredAt = tonumber(redis.call('HGET', KEYS[1], 'retiredAt') or '-1')
+if timestamp <= retiredAt then return 'identity_conflict' end
+if timestamp <= tonumber(redis.call('HGET', KEYS[3], 'retiredAt') or '-1') then return 'identity_conflict' end
+local status = 'registered'
+local active = false
+if redis.call('HEXISTS', KEYS[1], 'signingPublicKey') == 1 then
+  if redis.call('HGET', KEYS[1], 'lastHash') ~= ARGV[7]
+    or redis.call('HGET', KEYS[1], 'requestDigest') ~= ARGV[8] then return 'retry' end
+  local current = tonumber(redis.call('HGET', KEYS[1], 'registeredAt'))
+  if timestamp < current then return 'identity_conflict' end
+  if timestamp == current then
+    if redis.call('HGET', KEYS[1], 'requestDigest') == ARGV[6] then return 'idempotent' end
+    return 'identity_conflict'
+  end
+  status = 'refreshed'
+  if ARGV[3] ~= ARGV[7] then status = 'rotated' end
+  if retiredAt >= 0 then status = 'registered' else active = true end
+elseif ARGV[7] ~= '' or ARGV[8] ~= '' then
+  return 'retry'
+end
+local rn, kb = ARGV[9], #ARGV[1]
+-- A stored descriptor and card record (jb: their charged bytes; both are deleted at unregister).
+local jb = tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') + tonumber(redis.call('HGET', KEYS[4], 'jb') or '0')
+-- Block records (bb) and the wake registration (wb) belong to an active identity only (unregister deletes them).
+local bb, wb = 0, 0
+if active then
+  bb = tonumber(redis.call('HGET', KEYS[1], 'bb') or '0')
+  wb = tonumber(redis.call('HGET', KEYS[1], 'wb') or '0')
+end
+local held, old = 0, redis.call('HGET', KEYS[1], 'regnet')
+if active then held = tonumber(redis.call('HGET', KEYS[1], 'kb') or '0') + jb + bb + wb end
+local need = kb + jb + bb + wb
+if old == rn then need = need - held end
+if overBudget(rn, need, tonumber(ARGV[10]), tonumber(ARGV[11]), tonumber(ARGV[12]), tonumber(ARGV[13])) then return 'rate_limited' end
+if need > 0 and atCapacity(tonumber(ARGV[14])) then return 'relay_busy' end
+if held > 0 then charge(old, -held) end
+charge(rn, kb + jb + bb + wb)
+redis.call('HSET', KEYS[1], 'kel', ARGV[1], 'seq', ARGV[2], 'lastHash', ARGV[3], 'signingPublicKey', ARGV[4],
+  'registeredAt', ARGV[5], 'requestDigest', ARGV[6], 'regnet', rn, 'kb', kb, 'delegatedAt', ARGV[15], 'notAfter', ARGV[16])
+redis.call('HDEL', KEYS[1], 'retiredAt')
+redis.call('PERSIST', KEYS[1])
+-- The descriptor and card record horizons (their issuedAt and digest fields in the horizon hash) outlive their expired records.
+for _, doc in ipairs({{KEYS[2], 'issuedAt', 'digest'}, {KEYS[4], 'cardIssuedAt', 'cardDigest'}}) do
+  redis.call('PERSIST', doc[1])
+  local issuedAt = redis.call('HGET', KEYS[3], doc[2])
+  if issuedAt and redis.call('HEXISTS', doc[1], 'issuedAt') == 0 then
+    redis.call('HSET', doc[1], 'issuedAt', issuedAt, 'digest', redis.call('HGET', KEYS[3], doc[3]))
+  end
+end
+return status
+`;
+
+// KEYS: identity, descriptor, directory, blocks, inbox, inbox-meta, inbox-dedup, inbox-strangers, horizon, card. ARGV:
+// auth timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
+// It frees far more than the horizon it writes, so it runs even when the store is full. Deletes queue, descriptor and
+// card record documents, directory and directory-tag entries (derived keys, named by the card's `tags`), blocks and
+// the wake registration, releasing their charges; keeps the KEL (its charge lapses with the packet window), the
+// descriptor's and card record's issuedAt/digest and a retiredAt barrier for OFFLINE_WINDOW_SECONDS, and the
+// fixed-size horizon (Horizon) forever (07 § Registration). The handle binding and its skeleton stay forever
+// (07 § Descriptors and cards).
+const UNREGISTER_IDENTITY_SCRIPT = RUNS_WHEN_FULL + IDENTITY_LUA + BYTES_LUA + `
+if not isActive(KEYS[1]) then return 'not_registered' end
+if redis.call('HGET', KEYS[1], 'lastHash') ~= ARGV[3] or redis.call('HGET', KEYS[1], 'requestDigest') ~= ARGV[4] then return 'identity_conflict' end
+if tonumber(ARGV[1]) <= tonumber(redis.call('HGET', KEYS[1], 'registeredAt')) then return 'identity_conflict' end
+local rn = redis.call('HGET', KEYS[1], 'regnet')
+charge(rn, -tonumber(redis.call('HGET', KEYS[2], 'jb') or '0') - tonumber(redis.call('HGET', KEYS[10], 'jb') or '0')
+  - tonumber(redis.call('HGET', KEYS[1], 'bb') or '0') - tonumber(redis.call('HGET', KEYS[1], 'wb') or '0'))
+redis.call('HDEL', KEYS[1], 'bb', 'wb')
+redis.call('DEL', '${WAKE_KEY_PREFIX}' .. ARGV[2])
+retire(rn, tonumber(redis.call('HGET', KEYS[1], 'kb') or '0'), tonumber(ARGV[5]), tonumber(ARGV[6]))
+redis.call('HDEL', KEYS[2], 'json', 'lastHash', 'expiresAt', 'profiles', 'jb')
+for tag in string.gmatch(redis.call('HGET', KEYS[10], 'tags') or '', '%S+') do
+  redis.call('ZREM', '${DIRECTORY_TAG_KEY_PREFIX}' .. tag, ARGV[2])
+end
+redis.call('HDEL', KEYS[10], 'json', 'lastHash', 'contact', 'listed', 'tags', 'jb')
+redis.call('ZREM', KEYS[3], ARGV[2])
+releaseQueue(KEYS[6])
+redis.call('DEL', KEYS[4], KEYS[5], KEYS[6], KEYS[7], KEYS[8])
+redis.call('HSET', KEYS[1], 'retiredAt', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ${OFFLINE_WINDOW_SECONDS})
+-- One horizon per ACE ID, charged once (to the network the identity first retired from) and never released.
+if redis.call('EXISTS', KEYS[9]) == 0 then charge(rn, ${HORIZON_BYTES}) end
+redis.call('DEL', KEYS[9])
+redis.call('HSET', KEYS[9], 'retiredAt', ARGV[1], 'epochSeq', ARGV[10], 'epochStartHash', ARGV[11], 'lastSeq', ARGV[12],
+  'lastHash', ARGV[3])
+for _, doc in ipairs({{KEYS[2], 'issuedAt', 'digest'}, {KEYS[10], 'cardIssuedAt', 'cardDigest'}}) do
+  local issuedAt = redis.call('HGET', doc[1], 'issuedAt')
+  if issuedAt then redis.call('HSET', KEYS[9], doc[2], issuedAt, doc[3], redis.call('HGET', doc[1], 'digest')) end
+  if redis.call('EXISTS', doc[1]) == 1 then redis.call('EXPIRE', doc[1], ${OFFLINE_WINDOW_SECONDS}) end
+end
+return 'removed'
+`;
+
+/**
+ * `retry`: the stored version (lastHash, requestDigest) changed between the route's read and the write; the route
+ * re-reads and re-checks. `rate_limited`: the registering network is over its byte budget. `relay_busy`: the store is
+ * at the relay-wide high-water mark.
+ */
+export type RegistrationStatus = 'registered' | 'idempotent' | 'refreshed' | 'rotated' | 'identity_conflict' | 'retry' | 'rate_limited'
+  | 'relay_busy';
+export type UnregisterStatus = 'removed' | 'not_registered' | 'identity_conflict';
+
+export interface RegistrationWrite {
+  aceId: string;
+  /** The request's verified log and the fields derived from it. */
+  kel: KelEvent[];
+  seq: number;
+  lastHash: string;
+  signingPublicKey: string;
+  delegatedAt: number;
+  notAfter: number | null;
+  timestamp: number;
+  requestDigest: string;
+  /**
+   * The stored version the route read: its lastHash and requestDigest (both null: no identity). Any other stored
+   * state → `retry`, nothing written.
+   */
+  expectedLastHash: string | null;
+  expectedRequestDigest: string | null;
+  /** The registration's network (`registrationNetworkOf`), charged with the stored bytes and recorded as `regnet`. */
+  network: string;
+}
+
+type ScriptRedis = Redis & {
+  registerIdentity(...keysAndArgs: string[]): Promise<RegistrationStatus>;
+  unregisterIdentity(...keysAndArgs: string[]): Promise<UnregisterStatus>;
+};
+
+export class IdentityStore {
+  private redis: ScriptRedis;
+
+  constructor(redis: Redis, private readonly budget: ByteBudget) {
+    this.redis = redis as ScriptRedis;
+    redis.defineCommand('registerIdentity', { numberOfKeys: 4, lua: REGISTER_IDENTITY_SCRIPT });
+    redis.defineCommand('unregisterIdentity', { numberOfKeys: 10, lua: UNREGISTER_IDENTITY_SCRIPT });
+  }
+
+  /** The active registration without its log (fixed size), or null. */
+  async read(aceId: string): Promise<StoredIdentity | null> {
+    const values = await this.redis.hmget(identityKey(aceId), ...IDENTITY_FIELDS);
+    const identity = parseIdentityHash(aceId, Object.fromEntries(IDENTITY_FIELDS.flatMap((f, i) => values[i] === null ? [] : [[f, values[i]]])));
+    return identity?.retiredAt === undefined ? identity : null;
+  }
+
+  /** The requestDigest of the active registration, or null; reads two fields, not the KEL (listen streams). */
+  async currentRequestDigest(aceId: string): Promise<string | null> {
+    const [digest, retiredAt] = await this.redis.hmget(identityKey(aceId), 'requestDigest', 'retiredAt');
+    return retiredAt === null ? digest : null;
+  }
+
+  /**
+   * The registration with its log, active or retired (the log survives retirement for OFFLINE_WINDOW_SECONDS); for
+   * registration and unregister only, which need the log itself.
+   */
+  async readHistory(aceId: string): Promise<StoredHistory | null> {
+    const d = await this.redis.hgetall(identityKey(aceId));
+    const identity = parseIdentityHash(aceId, d);
+    return identity && { ...identity, kel: JSON.parse(d.kel) as KelEvent[] };
+  }
+
+  /** The anti-rollback horizon of an identity unregistered here, or null. */
+  async readHorizon(aceId: string): Promise<Horizon | null> {
+    identityKey(aceId); // validates the ACE ID
+    const h = await this.redis.hgetall(HORIZON_KEY_PREFIX + aceId);
+    if (h.retiredAt === undefined) return null;
+    return {
+      retiredAt: Number(h.retiredAt), epochSeq: Number(h.epochSeq), epochStartHash: h.epochStartHash, lastSeq: Number(h.lastSeq),
+      lastHash: h.lastHash,
+    };
+  }
+
+  /** Atomic ordered write of the identity (07 § Registration). */
+  register(w: RegistrationWrite): Promise<RegistrationStatus> {
+    return this.redis.registerIdentity(
+      identityKey(w.aceId), DESCRIPTOR_KEY_PREFIX + w.aceId, HORIZON_KEY_PREFIX + w.aceId, CARD_KEY_PREFIX + w.aceId,
+      JSON.stringify(w.kel), String(w.seq), w.lastHash, w.signingPublicKey, String(w.timestamp), w.requestDigest,
+      w.expectedLastHash ?? '', w.expectedRequestDigest ?? '', w.network, ...budgetArgs(this.budget),
+      String(w.delegatedAt), w.notAfter === null ? '' : String(w.notAfter),
+    );
+  }
+
+  /**
+   * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor and card record documents, blocks
+   * and wake in one script; the KEL and a retiredAt barrier remain for OFFLINE_WINDOW_SECONDS, the horizon (`epoch`:
+   * the KEL's last root epoch event and its last seq; its last hash is `expectedLastHash`) forever.
+   */
+  unregister(aceId: string, signedTimestamp: number, expectedLastHash: string, expectedRequestDigest: string,
+    epoch: { epochSeq: number; epochStartHash: string; lastSeq: number }): Promise<UnregisterStatus> {
+    return this.redis.unregisterIdentity(
+      identityKey(aceId), DESCRIPTOR_KEY_PREFIX + aceId, DIRECTORY_KEY, BLOCKS_KEY_PREFIX + aceId, ...queueKeys(aceId),
+      HORIZON_KEY_PREFIX + aceId, CARD_KEY_PREFIX + aceId,
+      String(signedTimestamp), aceId, expectedLastHash, expectedRequestDigest, ...budgetArgs(this.budget),
+      String(epoch.epochSeq), epoch.epochStartHash, String(epoch.lastSeq),
+    );
+  }
+}

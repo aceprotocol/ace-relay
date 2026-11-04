@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+.idea
+.claude
+.env
+.env.*
+tests
+*.test.ts
+*.log
+dump.rdb
