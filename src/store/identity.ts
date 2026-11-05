@@ -1,6 +1,6 @@
 import type Redis from 'ioredis';
 import { OFFLINE_WINDOW_SECONDS, isACEId, type KelEvent } from '@ace-protocol/sdk';
-import { RelayError } from '../errors.js';
+import { RelayError, parseStored } from '../errors.js';
 import {
   BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, DIRECTORY_TAG_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
   queueKeys,
@@ -247,7 +247,7 @@ export class IdentityStore {
   async readHistory(aceId: string): Promise<StoredHistory | null> {
     const d = await this.redis.hgetall(identityKey(aceId));
     const identity = parseIdentityHash(aceId, d);
-    return identity && { ...identity, kel: JSON.parse(d.kel) as KelEvent[] };
+    return identity && { ...identity, kel: parseStored<KelEvent[]>(d.kel, `log of ${aceId}`) };
   }
 
   /** The anti-rollback horizon of an identity unregistered here, or null. */
