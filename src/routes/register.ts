@@ -1,8 +1,8 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
-  MAX_PUBLISHED_AGENT_BYTES, eventHashes, extendKel, toBase64, verifyRegistrationRequest, type KelState,
+  MAX_PUBLISHED_AGENT_BYTES, eventHashes, extendKel, isPrimaryRotation, reclaimPoint, toBase64, verifyRegistrationRequest, type KelState,
 } from '@ace-protocol/sdk';
-import type { Horizon, StoredHistory } from '../store/identity.js';
+import type { Horizon, Reclaim, StoredHistory } from '../store/identity.js';
 import { BUSY_RETRY_SECONDS, RelayError, relayBusy, sdk } from '../errors.js';
 import {
   authenticate, enforceRegistrationRate, registeredState, registrationNetworkOf, type RouteDeps,
@@ -26,11 +26,12 @@ function checkAgainstStored(stored: StoredHistory, requestKel: unknown[], now: n
   }
 }
 
-/** The horizon of a KEL: its last root-epoch event (its last `icp` or `rot`) and its last seq. */
-export function epochOf(s: KelState): { epochSeq: number; epochStartHash: string; lastSeq: number } {
+/** The horizon of a KEL: its last root-epoch event (its last `icp` or `rot`), its last seq and its reclaim point. */
+export function epochOf(s: KelState): { epochSeq: number; epochStartHash: string; lastSeq: number; reclaim: Reclaim | null } {
   let epochSeq = s.events.length - 1;
   while (s.events[epochSeq].t !== 'icp' && s.events[epochSeq].t !== 'rot') epochSeq--;
-  return { epochSeq, epochStartHash: eventHashes(s)[epochSeq], lastSeq: s.events.length - 1 };
+  const hashes = eventHashes(s), r = reclaimPoint(s.events);
+  return { epochSeq, epochStartHash: hashes[epochSeq], lastSeq: s.events.length - 1, reclaim: r === null ? null : { seq: r, prevHash: hashes[r - 1] } };
 }
 
 /**
@@ -38,11 +39,13 @@ export function epochOf(s: KelState): { epochSeq: number; epochStartHash: string
  * candidate must carry the epoch's first event: a fork at or before it is never a valid recovery under 01 rule 6
  * (`kel_conflict`). It is then accepted when its event at lastSeq is the retired last event (an extension), or when it
  * holds a `rot` after the epoch start, which only the holder of the committed next root can sign (the owner's
- * recovery). Otherwise a candidate ending before lastSeq is `stale_seq` (a prefix, or a fork the relay can no longer
- * tell from one) and any other `kel_conflict`.
+ * recovery), or when it carries the event before the reclaim point followed by a primary `rot` (the next root
+ * reclaiming it, 01 rule 6). Otherwise a candidate ending before lastSeq is `stale_seq` (a prefix, or a fork the relay
+ * can no longer tell from one) and any other `kel_conflict`.
  */
 function checkAgainstHorizon(h: Horizon, cand: KelState): void {
   const ch = eventHashes(cand);
+  if (h.reclaim && ch[h.reclaim.seq - 1] === h.reclaim.prevHash && isPrimaryRotation(cand.events, h.reclaim.seq)) return; // reclaimed
   if (ch[h.epochSeq] !== h.epochStartHash) throw new RelayError('kel_conflict', 'the KEL does not carry the retired log');
   if (ch[h.lastSeq] === h.lastHash) return; // extended (or equal)
   if (cand.events.some((e, i) => i > h.epochSeq && e.t === 'rot')) return; // recovered

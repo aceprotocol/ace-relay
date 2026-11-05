@@ -14,7 +14,7 @@
  * |                   |        | expiring OFFLINE_WINDOW                                                   |
  * | horizon:<id>      | hash   | forever, written at unregister (fixed size): retiredAt, epochSeq +        |
  * |                   |        | epochStartHash, lastSeq + lastHash, descriptor issuedAt + digest, card    |
- * |                   |        | cardIssuedAt + cardDigest                                                 |
+ * |                   |        | cardIssuedAt + cardDigest, reclaimSeq + reclaimPrevHash (if any)           |
  * | descriptor:<id>   | hash   | newest issuedAt + claims digest (as long as the identity); json/lastHash/  |
  * |                   |        | expiresAt/profiles/jb (charged json bytes) until unregister; absent       |
  * |                   |        | (not served, no bar to publishing) while lastHash is not the registered   |

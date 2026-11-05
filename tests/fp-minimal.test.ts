@@ -1,8 +1,10 @@
 // Stranger quotas, storage bounds, liveness of permit issuers, unknown routes.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, SoftwareIdentity, SoftwareKey, createPermit, createRegistrationRequest, fromBase64,
+  MAX_PACKET_BYTES, OFFLINE_WINDOW_SECONDS, SoftwareIdentity, SoftwareKey, createPermit, createRegistrationRequest, fromBase64, generateSoftwareKey, keyDigest,
+  toBase64, verifyKel, type KelEvent,
 } from '@ace-protocol/sdk';
+import { createDelegation, createInception, createRotation } from '@ace-protocol/sdk/testing';
 import {
   networkBytes,
   RELAY_URL, authHeaders, block, createTestRelay, descriptorOf, newAgent, now, packet, publish, publishCard, published, register, send, unregister,
@@ -164,6 +166,41 @@ describe('A10 storage bounds', () => {
     await fork.delegate({ now: T });
     expect(fork.getKel()).toHaveLength(a.id.getKel().length + 1);
     expect((await register(fixed, { ...a, id: fork }, T + 2)).json().error).toBe('kel_conflict');
+  });
+
+  it('the horizon keeps the reclaim point: the next root reclaims after the KEL expired (01 rule 6)', async () => {
+    const [r0, r1, r2, b0, b1] = Array.from({ length: 5 }, () => generateSoftwareKey());
+    const d = (k: SoftwareKey) => keyDigest(k.scheme, k.publicKey());
+    // An identity whose software root is held in the export, its signing key the last dlg's.
+    const as = (root: SoftwareKey, signing: SoftwareKey, kel: KelEvent[]): Agent => {
+      const id = SoftwareIdentity.fromExport({ rootSeed: toBase64(root.seed), signingSeed: toBase64(signing.seed), kel });
+      return { id, aceId: id.getACEId(), vault: undefined as never };
+    };
+    const extend = async (kel: KelEvent[], ev: KelEvent, root: SoftwareKey, signing: SoftwareKey) => {
+      const st = verifyKel([...kel, ev], T);
+      return [...kel, ev, await createDelegation(st, root, signing.publicKey(), T)];
+    };
+    const icp = await createInception(r0, d(r1), T, d(b0));
+    const s1 = generateSoftwareKey();
+    const base = [icp, await createDelegation(verifyKel([icp], T), r0, s1.publicKey(), T)];
+    const a = as(r0, s1, base);
+    expect((await register(fixed, a, T)).statusCode).toBe(200);
+    // The fallback root alone takes it over; then it is retired and its KEL expires.
+    const s2 = generateSoftwareKey();
+    const byFallback = await extend(base, await createRotation(verifyKel(base, T), b0, d(r1), T, d(b1)), b0, s2);
+    const recovered = as(b0, s2, byFallback);
+    expect((await register(fixed, recovered, T + 1)).json()).toEqual({ ok: true, status: 'rotated' });
+    await unregistered(recovered, T + 2);
+    await expire(a.aceId);
+    expect(await fixed.redis.hmget(`ace:horizon:${a.aceId}`, 'epochSeq', 'reclaimSeq')).toEqual(['2', '2']);
+    // A thief holding the stolen fallback root cannot re-fork at the reclaim point (it reveals no next root).
+    const s4 = generateSoftwareKey();
+    const refork = await extend(base, await createRotation(verifyKel(base, T), b0, d(r2), T, d(b1)), b0, s4);
+    expect((await register(fixed, as(b0, s4, refork), T + 3)).json().error).toBe('kel_conflict');
+    // The next root reclaims at the fallback rot's seq: a fork at the retired epoch start, before the epoch's own events.
+    const s3 = generateSoftwareKey();
+    const reclaimed = await extend(base, await createRotation(verifyKel(base, T), r1, d(r2), T), r1, s3);
+    expect((await register(fixed, as(r1, s3, reclaimed), T + 3)).json()).toEqual({ ok: true, status: 'registered' });
   });
 
   it('legitimate re-registration extending the horizon accepted, and a rot recovery (01 rule 6)', async () => {

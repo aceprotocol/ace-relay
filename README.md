@@ -147,7 +147,10 @@ streams; the handle binding and its skeleton stay. The KEL, the descriptor's and
 seq and hash of the KEL's last root-epoch event (its last `icp` or `rot`) and of its last event. After the KEL expired,
 a registration must carry that epoch event (`kel_conflict`) and either carry the last event (an extension) or hold a
 `rot` after the epoch start, which only the holder of the committed next root can sign (recovery); otherwise it is
-`stale_seq` when shorter than the retired log and `kel_conflict` when not, and its timestamp must exceed the barrier.
+`stale_seq` when shorter than the retired log and `kel_conflict` when not, and its timestamp must exceed the barrier. When
+the KEL has a reclaim point (its first fallback `rot` whose preceding next root it never revealed), the horizon also keeps
+its seq and the hash of the event before it, and accepts a candidate carrying that event followed by a primary `rot`
+(01 rule 6).
 Superseded keys therefore cannot roll the identity back here.
 
 **Errors** are `{error, message?}` with the codes and statuses of 07 § Errors; `rate_limited` and

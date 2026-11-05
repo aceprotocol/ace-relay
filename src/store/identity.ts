@@ -42,7 +42,11 @@ export interface Horizon {
   epochStartHash: string;
   lastSeq: number;
   lastHash: string;
+  /** The reclaim point's seq and the hash of the event before it (07 § Registration), when the KEL has one. */
+  reclaim: Reclaim | null;
 }
+
+export interface Reclaim { seq: number; prevHash: string }
 
 /** Bytes a horizon is charged permanently to its registration network: an upper bound of its stored size. */
 export const HORIZON_BYTES = 512;
@@ -137,7 +141,8 @@ return status
 `;
 
 // KEYS: identity, descriptor, directory, blocks, inbox, inbox-meta, inbox-dedup, inbox-strangers, horizon, card. ARGV:
-// auth timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq.
+// auth timestamp, aceId, expected lastHash, expected requestDigest, the ByteBudget (5), epochSeq, epochStartHash, lastSeq,
+// reclaimSeq and reclaimPrevHash ('' when the KEL has no reclaim point).
 // It frees far more than the horizon it writes, so it runs even when the store is full. Deletes queue, descriptor and
 // card record documents, directory and directory-tag entries (derived keys, named by the card's `tags`), blocks and
 // the wake registration, releasing their charges; keeps the KEL (its charge lapses with the packet window), the
@@ -169,6 +174,7 @@ if redis.call('EXISTS', KEYS[9]) == 0 then charge(rn, ${HORIZON_BYTES}) end
 redis.call('DEL', KEYS[9])
 redis.call('HSET', KEYS[9], 'retiredAt', ARGV[1], 'epochSeq', ARGV[10], 'epochStartHash', ARGV[11], 'lastSeq', ARGV[12],
   'lastHash', ARGV[3])
+if ARGV[13] ~= '' then redis.call('HSET', KEYS[9], 'reclaimSeq', ARGV[13], 'reclaimPrevHash', ARGV[14]) end
 for _, doc in ipairs({{KEYS[2], 'issuedAt', 'digest'}, {KEYS[10], 'cardIssuedAt', 'cardDigest'}}) do
   local issuedAt = redis.call('HGET', doc[1], 'issuedAt')
   if issuedAt then redis.call('HSET', KEYS[9], doc[2], issuedAt, doc[3], redis.call('HGET', doc[1], 'digest')) end
@@ -252,6 +258,7 @@ export class IdentityStore {
     return {
       retiredAt: Number(h.retiredAt), epochSeq: Number(h.epochSeq), epochStartHash: h.epochStartHash, lastSeq: Number(h.lastSeq),
       lastHash: h.lastHash,
+      reclaim: h.reclaimSeq === undefined ? null : { seq: Number(h.reclaimSeq), prevHash: h.reclaimPrevHash },
     };
   }
 
@@ -268,15 +275,16 @@ export class IdentityStore {
   /**
    * Requires `signedTimestamp` > the stored registeredAt. Deletes queue, descriptor and card record documents, blocks
    * and wake in one script; the KEL and a retiredAt barrier remain for OFFLINE_WINDOW_SECONDS, the horizon (`epoch`:
-   * the KEL's last root epoch event and its last seq; its last hash is `expectedLastHash`) forever.
+   * the KEL's last root epoch event, its last seq and its reclaim point; its last hash is `expectedLastHash`) forever.
    */
   unregister(aceId: string, signedTimestamp: number, expectedLastHash: string, expectedRequestDigest: string,
-    epoch: { epochSeq: number; epochStartHash: string; lastSeq: number }): Promise<UnregisterStatus> {
+    epoch: { epochSeq: number; epochStartHash: string; lastSeq: number; reclaim: Reclaim | null }): Promise<UnregisterStatus> {
     return this.redis.unregisterIdentity(
       identityKey(aceId), DESCRIPTOR_KEY_PREFIX + aceId, DIRECTORY_KEY, BLOCKS_KEY_PREFIX + aceId, ...queueKeys(aceId),
       HORIZON_KEY_PREFIX + aceId, CARD_KEY_PREFIX + aceId,
       String(signedTimestamp), aceId, expectedLastHash, expectedRequestDigest, ...budgetArgs(this.budget),
       String(epoch.epochSeq), epoch.epochStartHash, String(epoch.lastSeq),
+      epoch.reclaim === null ? '' : String(epoch.reclaim.seq), epoch.reclaim?.prevHash ?? '',
     );
   }
 }
