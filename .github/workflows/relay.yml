@@ -49,7 +49,7 @@ env:
   # The spec revision whose test-vectors.json the relay tests replay, pinned to a full
   # commit SHA; bumping it is a reviewed relay commit, coherent with the locked SDK version.
   ACE_SPEC_REPO: aceprotocol/ace-spec
-  ACE_SPEC_SHA: 9c0472b286533ab84539811cb9638539310f7a70
+  ACE_SPEC_SHA: f5e6f7f8a4520df6987b130896aae14459a09143
 
 jobs:
   # Gate the image build on the test suite. The suites talk to a real Redis at
