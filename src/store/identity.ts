@@ -1,8 +1,9 @@
 import type Redis from 'ioredis';
-import { OFFLINE_WINDOW_SECONDS, isACEId, type KelEvent } from '@ace-protocol/sdk';
+import { OFFLINE_WINDOW_SECONDS, isACEId, isHex64, type KelEvent } from '@ace-protocol/sdk';
 import { RelayError, parseStored } from '../errors.js';
 import {
-  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, DIRECTORY_TAG_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX, WAKE_KEY_PREFIX,
+  BLOCKS_KEY_PREFIX, CARD_KEY_PREFIX, DESCRIPTOR_KEY_PREFIX, DIRECTORY_KEY, DIRECTORY_TAG_KEY_PREFIX, FALLBACK_KEY_PREFIX, HORIZON_KEY_PREFIX, IDENTITY_KEY_PREFIX,
+  WAKE_KEY_PREFIX,
   queueKeys,
 } from './keyspace.js';
 import { BYTES_LUA, CAPACITY_LUA, IDENTITY_LUA, MAY_GROW, RUNS_WHEN_FULL, budgetArgs, type ByteBudget } from './lua.js';
@@ -48,6 +49,9 @@ export interface Horizon {
 
 export interface Reclaim { seq: number; prevHash: string }
 
+/** Bytes a fallback binding is charged permanently to the network that made it: an upper bound of its stored size. */
+export const FALLBACK_BINDING_BYTES = 192;
+
 /** Bytes a horizon is charged permanently to its registration network: an upper bound of its stored size. */
 export const HORIZON_BYTES = 512;
 
@@ -82,7 +86,8 @@ function parseIdentityHash(aceId: string, d: Partial<Record<(typeof IDENTITY_FIE
 }
 
 // KEYS: identity, descriptor, horizon, card. ARGV: kel, seq, lastHash, signingPublicKey, timestamp, requestDigest,
-// expected lastHash, expected requestDigest, network, the ByteBudget (10..14), delegatedAt, notAfter ('' = none). The KEL's bytes (and a stored descriptor's
+// expected lastHash, expected requestDigest, network, the ByteBudget (10..14), delegatedAt, notAfter ('' = none), aceId, then
+// the KEL's fallback digests (07 § Registration: each one bound to no identity is bound to this one, charged for good). The KEL's bytes (and a stored descriptor's
 // and card record's) are charged to the network registered from; a registration over its budget (`rate_limited`), or
 // one that grows the store at the high-water mark (`relay_busy`), is refused. A retired identity's KEL charge lapses
 // with the packet window (see unregister), so a re-registration charges it afresh.
@@ -119,12 +124,20 @@ if active then
 end
 local held, old = 0, redis.call('HGET', KEYS[1], 'regnet')
 if active then held = tonumber(redis.call('HGET', KEYS[1], 'kb') or '0') + jb + bb + wb end
-local need = kb + jb + bb + wb
+-- New fallback bindings, charged permanently (never released).
+local fresh = {}
+for i = 18, #ARGV do
+  local fk = '${FALLBACK_KEY_PREFIX}' .. ARGV[i]
+  if redis.call('EXISTS', fk) == 0 then fresh[#fresh + 1] = fk end
+end
+local fbb = #fresh * ${FALLBACK_BINDING_BYTES}
+local need = kb + jb + bb + wb + fbb
 if old == rn then need = need - held end
 if overBudget(rn, need, tonumber(ARGV[10]), tonumber(ARGV[11]), tonumber(ARGV[12]), tonumber(ARGV[13])) then return 'rate_limited' end
 if need > 0 and atCapacity(tonumber(ARGV[14])) then return 'relay_busy' end
 if held > 0 then charge(old, -held) end
-charge(rn, kb + jb + bb + wb)
+charge(rn, kb + jb + bb + wb + fbb)
+for _, fk in ipairs(fresh) do redis.call('SET', fk, ARGV[17]) end
 redis.call('HSET', KEYS[1], 'kel', ARGV[1], 'seq', ARGV[2], 'lastHash', ARGV[3], 'signingPublicKey', ARGV[4],
   'registeredAt', ARGV[5], 'requestDigest', ARGV[6], 'regnet', rn, 'kb', kb, 'delegatedAt', ARGV[15], 'notAfter', ARGV[16])
 redis.call('HDEL', KEYS[1], 'retiredAt')
@@ -268,8 +281,15 @@ export class IdentityStore {
       identityKey(w.aceId), DESCRIPTOR_KEY_PREFIX + w.aceId, HORIZON_KEY_PREFIX + w.aceId, CARD_KEY_PREFIX + w.aceId,
       JSON.stringify(w.kel), String(w.seq), w.lastHash, w.signingPublicKey, String(w.timestamp), w.requestDigest,
       w.expectedLastHash ?? '', w.expectedRequestDigest ?? '', w.network, ...budgetArgs(this.budget),
-      String(w.delegatedAt), w.notAfter === null ? '' : String(w.notAfter),
+      String(w.delegatedAt), w.notAfter === null ? '' : String(w.notAfter), w.aceId,
+      ...w.kel.flatMap((e) => (typeof e.fallback === 'string' ? [e.fallback] : [])),
     );
+  }
+
+  /** The ACE ID the fallback commitment `digest` (64 lowercase hex) is bound to here, or null (07 § Registration). */
+  async fallbackOwner(digest: string): Promise<string | null> {
+    if (!isHex64(digest)) return null;
+    return this.redis.get(FALLBACK_KEY_PREFIX + digest);
   }
 
   /**

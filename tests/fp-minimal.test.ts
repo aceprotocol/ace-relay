@@ -188,11 +188,23 @@ describe('A10 storage bounds', () => {
     // The fallback root alone takes it over; then it is retired and its KEL expires.
     const s2 = generateSoftwareKey();
     const byFallback = await extend(base, await createRotation(verifyKel(base, T), b0, d(r1), T, d(b1)), b0, s2);
+    // Its holder, knowing only the digest it committed first, finds the log (07 § Registration, fallback bindings).
+    const found = await fixed.app.inject({ method: 'GET', url: `/v1/fallbacks/${Buffer.from(d(b0)).toString('hex')}` });
+    expect(found.json()).toEqual({ kel: base });
+    // A copy of the commitment in another identity's log is not bound to it.
+    const c0 = generateSoftwareKey(), cs = generateSoftwareKey();
+    const copyIcp = await createInception(c0, d(r1), T, d(b0));
+    const copy = [copyIcp, await createDelegation(verifyKel([copyIcp], T), c0, cs.publicKey(), T)];
+    expect((await register(fixed, as(c0, cs, copy), T)).statusCode).toBe(200);
+    expect((await fixed.app.inject({ method: 'GET', url: `/v1/fallbacks/${Buffer.from(d(b0)).toString('hex')}` })).json()).toEqual({ kel: base });
     const recovered = as(b0, s2, byFallback);
     expect((await register(fixed, recovered, T + 1)).json()).toEqual({ ok: true, status: 'rotated' });
     await unregistered(recovered, T + 2);
     await expire(a.aceId);
     expect(await fixed.redis.hmget(`ace:horizon:${a.aceId}`, 'epochSeq', 'reclaimSeq')).toEqual(['2', '2']);
+    // Retired: the binding stays but the lookup serves only a registered log.
+    const byDigest = (x: SoftwareKey) => fixed.app.inject({ method: 'GET', url: `/v1/fallbacks/${Buffer.from(d(x)).toString('hex')}` });
+    expect((await byDigest(b0)).json().error).toBe('unknown_peer');
     // A thief holding the stolen fallback root cannot re-fork at the reclaim point (it reveals no next root).
     const s4 = generateSoftwareKey();
     const refork = await extend(base, await createRotation(verifyKel(base, T), b0, d(r2), T, d(b1)), b0, s4);

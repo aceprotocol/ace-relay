@@ -104,6 +104,14 @@ export async function registerRoutes(app: FastifyInstance, deps: RegisterDeps): 
     throw new Error(`registration of ${request.aceId} lost the compare-and-set ${MAX_REGISTER_PASSES} times`);
   });
 
+  // 07 § Registration (fallback bindings): the registered log of the identity a fallback commitment is bound to.
+  app.get('/v1/fallbacks/:digest', async (req: FastifyRequest) => {
+    const owner = await identityStore.fallbackOwner((req.params as { digest: string }).digest);
+    const stored = owner === null ? null : await identityStore.readHistory(owner);
+    if (!stored || stored.retiredAt !== undefined) throw new RelayError('unknown_peer');
+    return { kel: stored.kel };
+  });
+
   app.post('/v1/unregister', async (req: FastifyRequest) => {
     const { identity, timestamp } = await authenticate(deps, req, { action: 'unregister' });
     // The log only for the horizon; the script refuses unless the record is still the one authenticated.

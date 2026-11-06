@@ -30,6 +30,8 @@
  * | handleof:<id>     | string | the identity's handle at this relay; permanent like handle:<handle>       |
  * | handle-skeleton:<s> | string | ACE ID of the bound handle with skeleton <s> (`handleSkeleton`);       |
  * |                   |        | permanent like handle:<handle>                                            |
+ * | fallback:<digest> | string | ACE ID a fallback commitment is bound to; permanent, never reassigned,    |
+ * |                   |        | survives unregister; its bytes charged to the registering network        |
  * | blocks:<id>       | hash   | peer → "<revision>:<0|1>", until unregister                               |
  * | wake:<id>         | hash   | g (gateway), t (token), a (armed 1|0), w (last wake ms); expires          |
  * |                   |        | OFFLINE_WINDOW after the identity's last wake/inbox/ack/listen; deleted   |
@@ -54,6 +56,7 @@ export const DESCRIPTOR_KEY_PREFIX = 'ace:descriptor:';
 export const DIRECTORY_KEY = 'ace:descriptors';
 export const CARD_KEY_PREFIX = 'ace:card:';
 export const HANDLE_KEY_PREFIX = 'ace:handle:';
+export const FALLBACK_KEY_PREFIX = 'ace:fallback:';
 export const HANDLE_OF_KEY_PREFIX = 'ace:handleof:';
 export const HANDLE_SKELETON_KEY_PREFIX = 'ace:handle-skeleton:';
 export const DIRECTORY_TAG_KEY_PREFIX = 'ace:directory-tag:';

@@ -27,6 +27,7 @@ request and derive the keys named by stored state or by a verified card's tags (
 | `POST /v1/card` | card record signature | CardBundle | `{ok}` |
 | `GET /v1/card/{aceId}` | — | — | CardBundle |
 | `GET /v1/handles/{handle}` | — | — | CardBundle |
+| `GET /v1/fallbacks/{digest}` | — | — | `{kel}` of the identity a fallback commitment is bound to |
 | `GET /v1/cards?tag&profile&cursor&limit` | — | — | `{cards: [CardBundle], cursor}` (the directory) |
 | `POST /v1/blocks` | `block` | `{peer, blocked, revision}` | `{ok}` |
 | `POST /v1/send` | permit or `contact: open` recipient | `{packet, permit?}` | `{ok}` |
@@ -150,7 +151,9 @@ a registration must carry that epoch event (`kel_conflict`) and either carry the
 `stale_seq` when shorter than the retired log and `kel_conflict` when not, and its timestamp must exceed the barrier. When
 the KEL has a reclaim point (its first fallback `rot` whose preceding next root it never revealed), the horizon also keeps
 its seq and the hash of the event before it, and accepts a candidate carrying that event followed by a primary `rot`
-(01 rule 6).
+(01 rule 6). Every `fallback` digest a registered KEL commits is bound,
+first come and permanently, to that identity (`ace:fallback:<digest>`, charged to the registering network), so the
+holder of a fallback root alone finds its log by `GET /v1/fallbacks/{digest}`.
 Superseded keys therefore cannot roll the identity back here.
 
 **Errors** are `{error, message?}` with the codes and statuses of 07 § Errors; `rate_limited` and
