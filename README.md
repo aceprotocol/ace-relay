@@ -181,7 +181,7 @@ Superseded keys therefore cannot roll the identity back here.
 | `MAX_INBOX_BYTES` | 24 MiB | normal queue bound per recipient, packet bytes (≥ `MAX_PACKET_BYTES`) |
 | `MAX_INBOX_SENDER_BYTES` | 8 MiB | normal queue share per (recipient, sender), packet bytes (≥ `MAX_PACKET_BYTES`) |
 | `REGISTRATION_NETWORK_BYTES` | 96 MiB | byte budget of one client network: the stored KELs, descriptors and card records of the identities registered from it, the KELs of identities retired from it (for the packet window), and the packets queued for them; a registration, publication or send over it gets `429 rate_limited` |
-| `TRUSTED_REGISTRATION_NETWORKS` | unset | comma-separated CIDRs of operator-known registration egress; each listed CIDR is one network with the larger budget below and `TRUSTED_REGISTER_RATE_LIMIT`. For the hosted MCP this is the **docker bridge subnet it reaches the relay from** (`docker network inspect relay-network --format '{{(index .IPAM.Config 0).Subnet}}'`). Attribution: a registration the MCP triggers from a tool call carries the end user's forwarded IP (`X-Forwarded-For` through the proxy) and is charged to that user's client network; one its background worker triggers (descriptor renewal, re-registration) comes from the bridge subnet and is charged to the trusted network. **The hosted MCP deployment must set it**, or all its worker-triggered registrations share one client network's 96 MiB and 20/h |
+| `TRUSTED_REGISTRATION_NETWORKS` | unset | comma-separated CIDRs of operator-known registration egress; each listed CIDR is one network with the larger budget below and `TRUSTED_REGISTER_RATE_LIMIT`. For an MCP host next to the relay this is the **docker bridge subnet it reaches the relay from** (`docker network inspect relay-network --format '{{(index .IPAM.Config 0).Subnet}}'`). Attribution: a registration the MCP triggers from a tool call carries the end user's forwarded IP (`X-Forwarded-For` through the proxy) and is charged to that user's client network; one its background worker triggers (descriptor renewal, re-registration) comes from the bridge subnet and is charged to the trusted network. **The hosted MCP deployment must set it**, or all its worker-triggered registrations share one client network's 96 MiB and 20/h |
 | `TRUSTED_REGISTRATION_NETWORK_BYTES` | 256 MiB | budget of each trusted registration network |
 | `STORAGE_HIGH_WATER_BYTES` | 384 MiB | relay-wide capacity: the store's **total** used memory (Valkey `used_memory`: identities, KELs, descriptors, horizons, queues, control keys and server overhead) at which registration, descriptor publication and send stop growing it (`429 rate_limited`, `Retry-After: 60`) and `/health` turns 503; set it below Valkey `maxmemory` with a reserve for control writes (default sized for 512 MiB) |
 | `SSE_PER_IDENTITY` / `GLOBAL_SSE_LIMIT` | 3 / 10000 | listen stream bounds (`rate_limited`) |
@@ -294,11 +294,10 @@ the GitHub environment `test` (from `test`) or `prod` (from `main`); give `prod`
 subject is therefore `repo:<org>/<repo>:environment:test` or `…:environment:prod`, so the trust policy of the
 `AWS_ROLE_ARN` role must match those (not a branch ref). Every
 deployment-specific value is an environment variable or secret (listed at the top of the workflow); the job fails
-before building when one is missing, including `TRUSTED_REGISTRATION_NETWORKS` (the Docker network subnet the hosted
-MCP reaches the relay from) and `STORAGE_HIGH_WATER_BYTES` (e.g. 402653184 under a 512 MiB `maxmemory`).
+before building when a required one is missing, including `STORAGE_HIGH_WATER_BYTES` (e.g. 402653184 under a 512 MiB `maxmemory`).
 `TRUST_PROXY` is set at deploy to loopback, the Docker network's gateway (the host nginx's hop) and, when
-`MCP_CONTAINER_IP` is set, the hosted MCP container's static address (ace-mcp pins it with `--ip`), since the MCP
-forwards its users' addresses. The container runs with `--cap-drop ALL --security-opt no-new-privileges`. The old
+`MCP_CONTAINER_IP` is set, the static address (`--ip`) of an MCP host container on the same Docker network, since it
+forwards its users' addresses; `TRUSTED_REGISTRATION_NETWORKS` is optional (set it to that network's subnet for such a host). The container runs with `--cap-drop ALL --security-opt no-new-privileges`. The old
 container is stopped and kept as `<name>-previous` until the new one runs and passes `/health`; otherwise the new one
 is removed and the previous one started again. The image has a Docker `HEALTHCHECK` on `/health`.
 `nginx.conf` is a per-environment template (`RELAY_HOST`, `APP_PORT`; see its header).

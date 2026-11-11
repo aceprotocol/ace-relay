@@ -8,8 +8,8 @@
 # Every deployment-specific value comes from that environment (give `prod` required
 # reviewers and restrict both to their branch; `flush_once` runs through the same gate):
 #   variables: AWS_REGION, ECR_REPOSITORY, PUBLIC_RELAY_URL, APP_PORT, METRICS_PORT,
-#              REDIS_DB, DOCKER_NETWORK, VALKEY_CONTAINER, TRUSTED_REGISTRATION_NETWORKS,
-#              STORAGE_HIGH_WATER_BYTES, and optionally MCP_CONTAINER_IP and WAKE_GATEWAYS (README; unset:
+#              REDIS_DB, DOCKER_NETWORK, VALKEY_CONTAINER, STORAGE_HIGH_WATER_BYTES, and optionally
+#              TRUSTED_REGISTRATION_NETWORKS, MCP_CONTAINER_IP and WAKE_GATEWAYS (README; unset:
 #              no wake hints)
 #   secrets:   AWS_ROLE_ARN, ECR_REGISTRY, DEPLOY_INSTANCE_ID, VALKEY_PASSWORD_SSM_PARAM
 #
@@ -127,9 +127,8 @@ jobs:
           REDIS_DB: ${{ vars.REDIS_DB }}
           DOCKER_NETWORK: ${{ vars.DOCKER_NETWORK }}
           VALKEY_CONTAINER: ${{ vars.VALKEY_CONTAINER }}
-          # Operator-known registration egress (the Docker network subnet the hosted MCP reaches the relay
-          # from), comma-separated CIDRs. Required: without it every worker-triggered MCP registration shares
-          # one client network's budget and rate.
+          # Operator-known registration egress (e.g. the Docker network subnet an MCP host on this network
+          # reaches the relay from), comma-separated CIDRs, if any.
           TRUSTED_REGISTRATION_NETWORKS: ${{ vars.TRUSTED_REGISTRATION_NETWORKS }}
           # Total used memory of the Valkey at which growth stops (README § Resource bounds). Sane default:
           # 402653184 (384 MiB) under a 512 MiB maxmemory. The measure is instance-wide, so every relay
@@ -143,8 +142,8 @@ jobs:
           VALKEY_PASSWORD_SSM_PARAM: ${{ secrets.VALKEY_PASSWORD_SSM_PARAM }}
         run: |
           # Strict shapes only: values are interpolated into the deploy step's remote shell script (the relay validates the
-          # semantics at startup). A required value's pattern rejects the empty string; MCP_CONTAINER_IP and WAKE_GATEWAYS
-          # are optional.
+          # semantics at startup). A required value's pattern rejects the empty string; TRUSTED_REGISTRATION_NETWORKS,
+          # MCP_CONTAINER_IP and WAKE_GATEWAYS are optional.
           check() { [[ "${!1}" =~ $2 ]] || { echo "$1 does not match $2" >&2; exit 1; }; }
           check AWS_REGION '^[a-z]{2}(-[a-z]+)+-[0-9]+$'
           check ECR_REPOSITORY '^[a-z0-9]+([._/-][a-z0-9]+)*$'
@@ -159,7 +158,7 @@ jobs:
           check DOCKER_NETWORK '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
           check VALKEY_CONTAINER '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
           check PUBLIC_RELAY_URL '^https://[a-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
-          check TRUSTED_REGISTRATION_NETWORKS '^[0-9A-Fa-f.:/,]+$'
+          check TRUSTED_REGISTRATION_NETWORKS '^[0-9A-Fa-f.:/,]*$'
           check WAKE_GATEWAYS '^[A-Za-z0-9.:/_,-]*$'
           check VALKEY_PASSWORD_SSM_PARAM '^[A-Za-z0-9_./-]+$'
 
@@ -200,8 +199,8 @@ jobs:
           TRUSTED_REGISTRATION_NETWORKS: ${{ vars.TRUSTED_REGISTRATION_NETWORKS }}
           STORAGE_HIGH_WATER_BYTES: ${{ vars.STORAGE_HIGH_WATER_BYTES }}
           WAKE_GATEWAYS: ${{ vars.WAKE_GATEWAYS }}
-          # The static address (ace-mcp runs it with --ip) of this environment's hosted MCP container, if any:
-          # it calls the relay over the Docker network and forwards each end user's address in X-Forwarded-For,
+          # The static address (`docker run --ip`) of an MCP host container on this environment's Docker network,
+          # if any: it calls the relay over the Docker network and forwards each end user's address in X-Forwarded-For,
           # so it is a trusted proxy.
           MCP_CONTAINER_IP: ${{ vars.MCP_CONTAINER_IP }}
           FLUSH_ONCE: ${{ inputs.flush_once == true && 'true' || 'false' }}
