@@ -99,6 +99,20 @@ export async function descriptorRoutes(app: FastifyInstance, deps: DescriptorDep
     return bundle;
   });
 
+  // 07 § WebFinger: the handle's binding for HTTP clients outside ACE; unsigned, ACE clients use /v1/handles.
+  const host = new URL(audience).host;
+  app.get('/.well-known/webfinger', async (req: FastifyRequest, reply) => {
+    const { resource } = req.query as { resource?: unknown };
+    const m = typeof resource === 'string' ? /^acct:([^@]+)@(.+)$/.exec(resource) : null;
+    if (!m) throw new RelayError('invalid_argument', 'resource must be acct:<handle>@<host>');
+    const bundle = m[2].toLowerCase() === host && isHandle(m[1]) ? await cards.resolveHandle(m[1]) : null;
+    if (!bundle) throw new RelayError('unknown_peer');
+    const { aceId } = bundle.card;
+    const link = (rel: string, path: string) => ({ rel: `https://aceprotocol.org/rel/${rel}`, type: 'application/json', href: `${audience}/v1/${path}/${aceId}` });
+    reply.header('content-type', 'application/jrd+json').header('access-control-allow-origin', '*');
+    return { subject: `acct:${m[1]}@${host}`, aliases: [aceId], links: [link('card', 'card'), link('descriptor', 'descriptor')] };
+  });
+
   app.get('/v1/cards', { schema: directorySchema }, async (req: FastifyRequest) => {
     await enforceRate(rateLimiter, `directory:${clientOf(req)}`, config.discoverRateLimit, 60, 'network');
     const q = req.query as { tag?: string; profile?: string; cursor?: string; limit?: number };

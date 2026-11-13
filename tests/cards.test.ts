@@ -145,6 +145,30 @@ describe('handles', () => {
     expect((await get('/v1/handles/X')).json().error).toBe('unknown_peer');
   });
 
+  it('WebFinger answers acct:<handle>@<host> with the ACE ID and record URLs (07 § WebFinger)', async () => {
+    const a = await registered(relay);
+    expect((await publishCard(relay, a, { handle: 'finger' })).statusCode).toBe(200);
+    const res = await get('/.well-known/webfinger?resource=acct:finger@RELAY.test');
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toMatch(/^application\/jrd\+json(;|$)/);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+    expect(res.json()).toEqual({
+      subject: 'acct:finger@relay.test',
+      aliases: [a.aceId],
+      links: [
+        { rel: 'https://aceprotocol.org/rel/card', type: 'application/json', href: `${RELAY_URL}/v1/card/${a.aceId}` },
+        { rel: 'https://aceprotocol.org/rel/descriptor', type: 'application/json', href: `${RELAY_URL}/v1/descriptor/${a.aceId}` },
+      ],
+    });
+    expect((await get(`/v1/card/${a.aceId}`)).statusCode).toBe(200);
+    for (const q of ['', '?resource=finger', '?resource=acct:finger', '?resource=https://relay.test/finger']) {
+      expect((await get(`/.well-known/webfinger${q}`)).json().error).toBe('invalid_argument');
+    }
+    for (const r of ['acct:finger@other.test', 'acct:nobody-here@relay.test', 'acct:X@relay.test']) {
+      expect((await get(`/.well-known/webfinger?resource=${r}`)).json().error).toBe('unknown_peer');
+    }
+  });
+
   it('handle is claimed only at home', async () => {
     const a = await registered(relay), b = await registered(relay);
     expect((await publishCard(relay, a, { home: OTHER_HOME, handle: 'roamer' })).statusCode).toBe(200);
